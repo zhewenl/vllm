@@ -1,7 +1,12 @@
 
 # The vLLM Dockerfile is used to construct vLLM image that can be directly used
 # to run the OpenAI compatible server.
+ENV http_proxy=http://127.0.0.1:8080 \
+    https_proxy=http://127.0.0.1:8080 \
+    HTTP_PROXY=http://127.0.0.1:8080 \
+    HTTPS_PROXY=http://127.0.0.1:8080
 
+RUN export http_proxy=http://127.0.0.1:8080 && export https_proxy=http://127.0.0.1:8080 && export HTTP_PROXY=http://127.0.0.1:8080 && export HTTPS_PROXY=http://127.0.0.1:8080
 # Please update any changes made here to
 # docs/contributing/dockerfile/dockerfile.md and
 # docs/assets/contributing/dockerfile-stages-dependency.png
@@ -80,6 +85,7 @@ ARG DEADSNAKES_GPGKEY_URL
 ARG GET_PIP_URL
 
 # Install Python and other dependencies
+RUN echo 'APT::Sandbox::User "root";' | tee -a /etc/apt/apt.conf.d/10sandbox
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
     && apt-get update -y \

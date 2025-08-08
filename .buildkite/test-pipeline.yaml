@@ -5,27 +5,11 @@ steps:
   #     - vllm/
   #   command: VLLM_ALL2ALL_BACKEND=pplx VLLM_USE_DEEP_GEMM=1 vllm bench throughput --model deepseek-ai/DeepSeek-R1 --tensor-parallel-size 8 --input-len 1000 --output-len 1000 --num-prompts 50  --enable-expert-parallel
 
-  # - label: DeepSeek + pplx v2
-  #   gpu: h200
-  #   num_gpus: 8
-  #   source_file_dependencies:
-  #     - vllm/
-  #   command: VLLM_ALL2ALL_BACKEND=pplx VLLM_USE_DEEP_GEMM=1 vllm bench throughput --model deepseek-ai/DeepSeek-R1 --tensor-parallel-size 8 --input-len 1000 --output-len 1000 --num-prompts 50
-
-  # - label: DeepSeek + nixl
-  #   gpu: h200
-  #   source_file_dependencies:
-  #     - vllm/
-  #   num_gpus: 8
-  #   command: VLLM_ALL2ALL_BACKEND=nixl VLLM_USE_DEEP_GEMM=1 vllm bench throughput --model deepseek-ai/DeepSeek-R1 --tensor-parallel-size 8 --input-len 1000 --output-len 1000 --num-prompts 50
-
-  # - label: DeepSeek + nixl v2
-  #   gpu: h200
-  #   source_file_dependencies:
-  #     - vllm/
-  #   num_gpus: 8
-  #   command: VLLM_ALL2ALL_BACKEND=nixl VLLM_USE_DEEP_GEMM=1 vllm bench throughput --model deepseek-ai/DeepSeek-R1 --tensor-parallel-size 8 --input-len 1000 --output-len 1000 --num-prompts 50  --enable-expert-parallel
-
+  - label: "Llama EP"
+    gpu: h200
+    num_gpus: 8
+    commands:
+      - vllm bench throughput --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size 2 --data-parallel-size 4 --enable-expert-parallel --max-model-len 2048 --input-len 1000 --output-len 1000 --num-prompts 50
 
   - label: "Llama EP: pplx + DeepGEMM"
     gpu: h200
@@ -37,10 +21,10 @@ steps:
     gpu: h200
     num_gpus: 8
     commands:
-      - VLLM_ALL2ALL_BACKEND=deepep VLLM_USE_DEEP_GEMM=1 vllm bench throughput --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size 2 --data-parallel-size 4 --enable-expert-parallel  --max-model-len 2048 --input-len 1000 --output-len 1000 --num-prompts 50
+      - VLLM_ALL2ALL_BACKEND=deepep_high_throughput VLLM_USE_DEEP_GEMM=1 vllm bench throughput --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size 2 --data-parallel-size 4 --enable-expert-parallel  --max-model-len 2048 --input-len 1000 --output-len 1000 --num-prompts 50
 
-  - label: "Llama EP: DeepEP only"
+  - label: "Llama EP: DeepEP"
     gpu: h200
     num_gpus: 8
     commands:
-      - VLLM_ALL2ALL_BACKEND=deepep vllm bench throughput --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size 2 --data-parallel-size 5 --enable-expert-parallel --max-model-len 2048 --input-len 1000 --output-len 1000 --num-prompts 50
+      - VLLM_ALL2ALL_BACKEND=deepep_low_latency vllm bench throughput --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tensor-parallel-size 2 --data-parallel-size 4 --enable-expert-parallel --max-model-len 2048 --input-len 1000 --output-len 1000 --num-prompts 50

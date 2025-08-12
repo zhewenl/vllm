@@ -1,7 +1,6 @@
 
 # The vLLM Dockerfile is used to construct vLLM image that can be directly used
 # to run the OpenAI compatible server.
-
 # Please update any changes made here to
 # docs/contributing/dockerfile/dockerfile.md and
 # docs/assets/contributing/dockerfile-stages-dependency.png
@@ -440,7 +439,7 @@ COPY tools/install_deepgemm.sh install_deepgemm.sh
 ENV CUDA_HOME=/usr/local/cuda
 RUN bash install_python_libraries.sh \
     && bash install_deepgemm.sh \
-    && bash install_nixl.sh --force \
+    && bash install_nixl.sh --force
 
 #################### vLLM installation IMAGE ####################
 

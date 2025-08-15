@@ -5,17 +5,25 @@ steps:
   #   source_file_dependencies:
   #     - vllm/
   #   command: CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_ALL2ALL_BACKEND=pplx VLLM_USE_DEEP_GEMM=1 vllm serve deepseek-ai/DeepSeek-V3-0324 --tensor-parallel-size 2 --data-parallel-size 2 --enable-expert-parallel --max-model-len 1024  --trust-remote-code
-
-  - label: "Llama EP"
+  - label: "Llama TP"
     gpu: h200
     num_gpus: 4
     commands:
       - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_LOGGING_LEVEL=DEBUG CUDA_LAUNCH_BLOCKING=1 VLLM_TRUST_REMOTE_CODE=1 SAFETENSORS_FAST_GPU=1 TORCH_SHOW_CPP_STACKTRACES=1 CUDA_ENABLE_CORE_DUMP_ON_EXCEPTION=1 \
         vllm bench throughput --model meta-llama/Llama-4-Scout-17B-16E-Instruct \
-          --tensor-parallel-size 2 --data-parallel-size 2 --enable-expert-parallel \
+          --tensor-parallel-size 4 --data-parallel-size 1 \
           --max-model-len 2048 --input-len 1000 --output-len 1000 --num-prompts 50  --trust-remote-code
 
-  - label: "Llama TP only"
+  - label: "Llama DP + EP"
+    gpu: h200
+    num_gpus: 4
+    commands:
+      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_LOGGING_LEVEL=DEBUG CUDA_LAUNCH_BLOCKING=1 VLLM_TRUST_REMOTE_CODE=1 SAFETENSORS_FAST_GPU=1 TORCH_SHOW_CPP_STACKTRACES=1 CUDA_ENABLE_CORE_DUMP_ON_EXCEPTION=1 \
+        vllm bench throughput --model meta-llama/Llama-4-Scout-17B-16E-Instruct \
+          --tensor-parallel-size 1 --data-parallel-size 4 \
+          --max-model-len 2048 --input-len 1000 --output-len 1000 --num-prompts 50  --trust-remote-code
+
+  - label: "Llama TP + EP"
     gpu: h200
     num_gpus: 4
     commands:
@@ -24,13 +32,22 @@ steps:
           --tensor-parallel-size 4 --data-parallel-size 1 --enable-expert-parallel \
           --max-model-len 2048 --input-len 1000 --output-len 1000 --num-prompts 50  --trust-remote-code
 
-  - label: "Llama DP only"
+  - label: "Llama DP + EP"
     gpu: h200
     num_gpus: 4
     commands:
       - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_LOGGING_LEVEL=DEBUG CUDA_LAUNCH_BLOCKING=1 VLLM_TRUST_REMOTE_CODE=1 SAFETENSORS_FAST_GPU=1 TORCH_SHOW_CPP_STACKTRACES=1 CUDA_ENABLE_CORE_DUMP_ON_EXCEPTION=1 \
         vllm bench throughput --model meta-llama/Llama-4-Scout-17B-16E-Instruct \
           --tensor-parallel-size 1 --data-parallel-size 4 --enable-expert-parallel \
+          --max-model-len 2048 --input-len 1000 --output-len 1000 --num-prompts 50  --trust-remote-code
+
+  - label: "Llama EP + DP + EP"
+    gpu: h200
+    num_gpus: 4
+    commands:
+      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_LOGGING_LEVEL=DEBUG CUDA_LAUNCH_BLOCKING=1 VLLM_TRUST_REMOTE_CODE=1 SAFETENSORS_FAST_GPU=1 TORCH_SHOW_CPP_STACKTRACES=1 CUDA_ENABLE_CORE_DUMP_ON_EXCEPTION=1 \
+        vllm bench throughput --model meta-llama/Llama-4-Scout-17B-16E-Instruct \
+          --tensor-parallel-size 2 --data-parallel-size 2 --enable-expert-parallel \
           --max-model-len 2048 --input-len 1000 --output-len 1000 --num-prompts 50  --trust-remote-code
 
   # - label: "Llama EP"

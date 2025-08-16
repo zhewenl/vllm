@@ -437,9 +437,21 @@ COPY tools/ep_kernels/install_python_libraries.sh install_python_libraries.sh
 COPY tools/install_nixl.sh install_nixl.sh
 COPY tools/install_deepgemm.sh install_deepgemm.sh
 ENV CUDA_HOME=/usr/local/cuda
-RUN bash install_python_libraries.sh \
-    && bash install_deepgemm.sh \
-    && bash install_nixl.sh --force
+RUN /tmp/install_nixl.sh --force \
+ && export NVSHMEM_DIR=${NVSHMEM_DIR:-/opt/nvshmem} \
+ && /tmp/ep_kernels/install_python_libraries.sh \
+ && /tmp/install_deepgemm.sh \
+ && python - <<'PY'
+import importlib, sys
+mods = ["deep_gemm","deepep","pplx_all2all","nixl"]
+for m in mods:
+    try:
+        importlib.import_module(m)
+        print("OK", m)
+    except Exception as e:
+        print("FAIL", m, "->", e, file=sys.stderr)
+        raise SystemExit(1)
+PY
 
 #################### vLLM installation IMAGE ####################
 

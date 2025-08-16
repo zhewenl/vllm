@@ -275,10 +275,6 @@ ARG PYTORCH_CUDA_INDEX_BASE_URL
 ENV UV_HTTP_TIMEOUT=500
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 
-# Workaround for #17068
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --no-build-isolation "git+https://github.com/state-spaces/mamba@v2.2.4"
-
 COPY requirements/lint.txt requirements/lint.txt
 COPY requirements/test.txt requirements/test.txt
 COPY requirements/dev.txt requirements/dev.txt
@@ -389,7 +385,7 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
 
 # Install FlashInfer from source
 ARG FLASHINFER_GIT_REPO="https://github.com/flashinfer-ai/flashinfer.git"
-ARG FLASHINFER_GIT_REF="v0.2.8rc1"
+ARG FLASHINFER_GIT_REF="v0.2.9rc1"
 RUN --mount=type=cache,target=/root/.cache/uv bash - <<'BASH'
   . /etc/environment
     git clone --depth 1 --recursive --shallow-submodules \
@@ -437,10 +433,9 @@ COPY tools/ep_kernels/install_python_libraries.sh install_python_libraries.sh
 COPY tools/install_nixl.sh install_nixl.sh
 COPY tools/install_deepgemm.sh install_deepgemm.sh
 ENV CUDA_HOME=/usr/local/cuda
-RUN /tmp/install_nixl.sh --force \
- && export NVSHMEM_DIR=${NVSHMEM_DIR:-/opt/nvshmem} \
- && /tmp/ep_kernels/install_python_libraries.sh \
- && /tmp/install_deepgemm.sh \
+RUN bash install_python_libraries.sh \
+    && bash install_deepgemm.sh \
+    && bash install_nixl.sh --force \
  && python - <<'PY'
 import importlib, sys
 mods = ["deep_gemm","deepep","pplx_all2all","nixl"]
@@ -471,10 +466,6 @@ ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 # Reference: https://github.com/astral-sh/uv/pull/1694
 ENV UV_HTTP_TIMEOUT=500
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
-
-# Workaround for #17068
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --no-build-isolation "git+https://github.com/state-spaces/mamba@v2.2.4"
 
 # install development dependencies (for testing)
 RUN --mount=type=cache,target=/root/.cache/uv \

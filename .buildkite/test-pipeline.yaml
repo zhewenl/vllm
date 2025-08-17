@@ -77,6 +77,8 @@ steps:
     gpu: h200
     num_gpus: 2
     commands:
+      - df -h /dev/shm || true
+      - ls -lh /dev/shm | head || true
       - CUDA_VISIBLE_DEVICES=1,2 VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=1  --dp-size=2 --max-model-len 2048
 
   - label: "Llama EP=4"
@@ -89,6 +91,8 @@ steps:
             - "--ipc=host"
             - "--shm-size=16g"
     commands:
+      - df -h /dev/shm || true
+      - ls -lh /dev/shm | head || true
       - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048
 
   - label: "Llama EP=4 + DeepGEMM"

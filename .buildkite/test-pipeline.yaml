@@ -1,8 +1,52 @@
 steps:
+  - label: "QwenMoE + a100"
+    gpu: a100
+    commands:
+      - 'CUDA_VISIBLE_DEVICES=1,2 VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model Qwen/Qwen1.5-MoE-A2.7B --tp-size=1  --dp-size=2 --max-model-len 2048'
+
+  - label: "Sanity Check: QwenMoE + a100 + DeepGEMM"
+    gpu: a100
+    num_gpus: 2
+    commands:
+      - 'CUDA_VISIBLE_DEVICES=1,2  VLLM_USE_DEEP_GEMM=1 VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model Qwen/Qwen1.5-MoE-A2.7B --tp-size=1  --dp-size=2 --max-model-len 2048'
+
+  - label: "Sanity Check: QwenMoE + a100 + DeepEP"
+    gpu: a100
+    commands:
+      - 'CUDA_VISIBLE_DEVICES=1,2 VLLM_ALL2ALL_BACKEND=deepep_high_throughput VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model Qwen/Qwen1.5-MoE-A2.7B --tp-size=1  --dp-size=2 --max-model-len 2048'
+
+  - label: "Sanity Check: QwenMoE + a100 + pplx"
+    gpu: a100
+    num_gpus: 2
+    commands:
+      - 'CUDA_VISIBLE_DEVICES=1,2 VLLM_ALL2ALL_BACKEND=pplx VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model Qwen/Qwen1.5-MoE-A2.7B --tp-size=1  --dp-size=2 --max-model-len 2048'
+
+  - label: "Sanity Check: QwenMoE + h200"
+    gpu: h200
+    commands:
+      - 'CUDA_VISIBLE_DEVICES=1,2 VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model Qwen/Qwen1.5-MoE-A2.7B --tp-size=1  --dp-size=2 --max-model-len 2048'
+
+  - label: "Sanity Check: QwenMoE + h200 2"
+    gpu: h200
+    num_gpus: 2
+    commands:
+      - 'CUDA_VISIBLE_DEVICES=1,2 VLLM_ALL2ALL_BACKEND=pplx VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model Qwen/Qwen1.5-MoE-A2.7B --tp-size=1  --dp-size=2 --max-model-len 2048'
+
+  - label: "Sanity Check: QwenMoE + pplx"
+    gpu: h200
+    plugins:
+      - docker#v5:               
+          options:
+            - "--gpus=all"
+            - "--ipc=host"
+            - "--shm-size=16g"
+    commands:
+      - 'CUDA_VISIBLE_DEVICES=1,2 VLLM_ALL2ALL_BACKEND=pplx VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model Qwen/Qwen1.5-MoE-A2.7B --tp-size=1  --dp-size=2 --max-model-len 2048'
+
   - label: "Llama EP=4"
     gpu: h200
     commands:
-      - 'CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048'
+      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048
 
   - label: "Llama EP=4 + DeepGEMM"
     gpu: h200

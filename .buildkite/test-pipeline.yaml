@@ -2,29 +2,29 @@ steps:
   - label: "Llama EP=4"
     gpu: h200
     commands:
-      - 'CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_LOGGING_LEVEL=DEBUG python examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048'
+      - 'CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048'
 
   - label: "Llama EP=4 + DeepGEMM"
     gpu: h200
     commands:
-      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_USE_DEEP_GEMM=1 VLLM_LOGGING_LEVEL=DEBUG python examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048
+      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_USE_DEEP_GEMM=1 VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048
 
   - label: "Llama EP=4 + DeepEP"
     gpu: h200
     commands:
-      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_ALL2ALL_BACKEND=deepep_high_throughput VLLM_LOGGING_LEVEL=DEBUG python examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048
+      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_ALL2ALL_BACKEND=deepep_high_throughput VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048
 
   - label: "Llama EP=4 + DeepEP + DeepGEMM"
     gpu: h200
     commands:
-      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_USE_DEEP_GEMM=1 VLLM_ALL2ALL_BACKEND=deepep_high_throughput VLLM_LOGGING_LEVEL=DEBUG python examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048
+      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_USE_DEEP_GEMM=1 VLLM_ALL2ALL_BACKEND=deepep_high_throughput VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048
 
   - label: "Llama EP=4 + pplx"
     gpu: h200
     commands:
-      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_ALL2ALL_BACKEND=pplx VLLM_LOGGING_LEVEL=DEBUG python examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048
+      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_ALL2ALL_BACKEND=pplx VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048
 
   - label: "Llama EP=4 + pplx + DeepGEMM"
     gpu: h200
     commands:
-      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_ALL2ALL_BACKEND=pplx VLLM_USE_DEEP_GEMM=1 VLLM_LOGGING_LEVEL=DEBUG python examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048
+      - CUDA_VISIBLE_DEVICES=1,2,3,4 VLLM_ALL2ALL_BACKEND=pplx VLLM_USE_DEEP_GEMM=1 VLLM_LOGGING_LEVEL=DEBUG python /vllm-workspace/examples/offline_inference/data_parallel.py --model meta-llama/Llama-4-Scout-17B-16E-Instruct --tp-size=2  --dp-size=2 --max-model-len 2048

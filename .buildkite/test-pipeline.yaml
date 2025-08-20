@@ -833,7 +833,7 @@ steps:
   - export VLLM_WORKER_MULTIPROC_METHOD=spawn
   - pytest -s -v test_lm_eval_correctness.py --config-list-file=configs/models-large.txt --tp-size=4
 
-- label: Qwen1.5 MoE EP Test # optional
+- label: Qwen MoE EP Test # optional
   gpu: h200
   optional: true
   num_gpus: 2

@@ -516,7 +516,7 @@ steps:
   - vllm/v1/attention
   - tests/kernels/attention
   commands:
-    - pytest -v -s kernels/attention --ignore=kernels/attention/test_flashinfer_mla_decode.py --ignore=kernels/attention/test_flashinfer_trtllm_attention.py --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+    - pytest -v -s kernels/attention --ignore-glob='kernels/attention/test_flashinfer*.py' --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
   parallelism: 2
 
 - label: Kernels Quantization Test %N # 64min

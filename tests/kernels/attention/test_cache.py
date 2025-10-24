@@ -664,6 +664,8 @@ def test_concat_and_cache_ds_mla(
 ) -> None:
     if dtype.itemsize != 2:
         pytest.skip("ds_mla only supports 16-bit input")
+    if current_platform.is_rocm():
+        pytest.skip("fp8_ds_mla is not supported on ROCm")
     kv_cache_dtype = "fp8_ds_mla"
     current_platform.seed_everything(seed)
     torch.set_default_device(device)
@@ -725,6 +727,10 @@ def test_concat_and_cache_ds_mla(
         for j in range(qk_rope_head_dim):
             ref_cache_16bit[kv_lora_rank // 2 + 8 + j] = k_pe[i, j]
 
+    # Skip schema and faketensor validation because kv_cache_dtype accepts custom
+    # string values like "fp8_ds_mla" which are not recognized by PyTorch's schema
+    # validator or fake tensor implementation. The implementation properly validates
+    # these strings at runtime.
     opcheck(
         torch.ops._C_cache_ops.concat_and_cache_mla,
         (kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale),

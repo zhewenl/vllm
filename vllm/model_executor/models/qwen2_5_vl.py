@@ -318,6 +318,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         use_data_parallel: bool = False,
         attn_backend: _Backend = _Backend.TORCH_SDPA,
         use_upstream_fa: bool = False,
+        attn_backend_override: _Backend | None = None,
     ) -> None:
         super().__init__()
         # Per attention head and per partition values.
@@ -358,6 +359,7 @@ class Qwen2_5_VisionAttention(nn.Module):
             maybe_get_vit_flash_attn_backend(
                 self.attn_backend,
                 self.use_upstream_fa,
+                attn_backend_override=attn_backend_override,
             )
         )
         self.is_flash_attn_backend = self.attn_backend in {
@@ -482,6 +484,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         use_data_parallel: bool = False,
         attn_backend: _Backend = _Backend.TORCH_SDPA,
         use_upstream_fa: bool = False,
+        attn_backend_override: _Backend | None = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -497,6 +500,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             use_data_parallel=use_data_parallel,
             attn_backend=attn_backend,
             use_upstream_fa=use_upstream_fa,
+            attn_backend_override=attn_backend_override,
         )
         self.mlp = Qwen2_5_VisionMLP(
             dim,
@@ -696,6 +700,13 @@ class Qwen2_5_VisionTransformer(nn.Module):
             dtype=torch.get_default_dtype(),
             attn_backend_override=attn_backend_override,
         )
+        # ROCm with FLASH_ATTN backend must use upstream flash_attn
+        # (vllm.vllm_flash_attn is CUDA-only)
+        from vllm.platforms import current_platform
+
+        if self.attn_backend == _Backend.FLASH_ATTN and not current_platform.is_cuda():
+            use_upstream_fa = True
+
         if (
             self.attn_backend != _Backend.FLASH_ATTN
             and self.attn_backend != _Backend.ROCM_AITER_FA
@@ -728,6 +739,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
                         use_data_parallel=use_data_parallel,
                         attn_backend=self.attn_backend,
                         use_upstream_fa=use_upstream_fa,
+                        attn_backend_override=attn_backend_override,
                     )
                     for layer_idx in range(depth)
                 ]

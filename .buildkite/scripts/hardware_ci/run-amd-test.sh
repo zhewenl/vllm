@@ -59,7 +59,7 @@ while true; do
         fi
 done
 
-echo "--- Pulling container" 
+echo "--- Pulling container"
 image_name="rocm/vllm-ci:${BUILDKITE_COMMIT}"
 container_name="rocm_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 10; echo)"
 docker pull "${image_name}"
@@ -173,9 +173,17 @@ fi
 PARALLEL_JOB_COUNT=8
 MYPYTHONPATH=".."
 
-# check if the command contains shard flag, we will run all shards in parallel because the host have 8 GPUs. 
+# Test that we're launching on the machine that has
+# proper access to GPUs
+render_gid=$(getent group render | cut -d: -f3)
+if [[ -z "$render_gid" ]]; then
+  echo "Error: 'render' group not found. This is required for GPU access." >&2
+  exit 1
+fi
+
+# check if the command contains shard flag, we will run all shards in parallel because the host have 8 GPUs.
 if [[ $commands == *"--shard-id="* ]]; then
-  # assign job count as the number of shards used   
+  # assign job count as the number of shards used
   commands=${commands//"--num-shards= "/"--num-shards=${PARALLEL_JOB_COUNT} "}
   for GPU in $(seq 0 $(($PARALLEL_JOB_COUNT-1))); do
     # assign shard-id for each shard
@@ -186,6 +194,7 @@ if [[ $commands == *"--shard-id="* ]]; then
         --device /dev/kfd $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES \
         --network=host \
         --shm-size=16gb \
+        --group-add "$render_gid" \
         --rm \
         -e HIP_VISIBLE_DEVICES="${GPU}" \
         -e HF_TOKEN \
@@ -217,8 +226,8 @@ else
           --device /dev/kfd $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES \
           --network=host \
           --shm-size=16gb \
+          --group-add "$render_gid" \
           --rm \
-          -e HIP_VISIBLE_DEVICES=0 \
           -e HF_TOKEN \
           -e AWS_ACCESS_KEY_ID \
           -e AWS_SECRET_ACCESS_KEY \

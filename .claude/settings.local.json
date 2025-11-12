@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(for log in /home/zhewenli/logs/vllm-ci/amd*.log)",
+      "Bash(for model in \"whisper\" \"Phi-3.5-vision\" \"Voxtral\" \"intfloat\" \"cross-encoder\" \"bge-reranker\" \"sentence-transformers\")",
+      "Bash(do echo \"=== $model ===\")",
+      "Bash(xargs:*)",
+      "Bash(done)",
+      "Bash(for file in test_mteb_score.py test_mteb_embed.py)",
+      "Bash(do echo \"$file:\")",
+      "Bash(for file in test_embedding.py test_encode.py)",
+      "Bash(for file in test_embedding.py test_embedding_dimensions.py test_embedding_long_text.py test_rerank.py test_score.py test_truncation.py test_vision_embedding.py)",
+      "Bash(pytest:*)",
+      "Bash(python3 -c \"from transformers import AutoProcessor; proc = AutoProcessor.from_pretrained(''''google/gemma-3-4b-it''''); print(type(proc)); print(hasattr(proc, ''''boi_token'''')); print(dir(proc) | grep -i token)\")",
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "Bash(HF_HUB_DISABLE_XET=1 wp pytest:*)",
+      "Bash(HF_HUB_DISABLE_XET=1 wp python -m pytest:*)",
+      "Bash(tee:*)",
+      "Bash(HF_HUB_DISABLE_XET=1 /home/zhewenli/uv_env/vllm-fork/bin/python -m pytest:*)",
+      "Bash(curl:*)",
+      "Bash(HF_HUB_DISABLE_XET=1 wp /home/zhewenli/uv_env/vllm-fork/bin/python:*)",
+      "Bash(PATH=/home/zhewenli/uv_env/vllm-fork/bin:$PATH HF_HUB_DISABLE_XET=1 wp:*)",
+      "Bash(PATH=/home/zhewenli/uv_env/vllm-fork/bin:$PATH CC=/usr/lib64/ccache/gcc HF_HUB_DISABLE_XET=1 wp:*)",
+      "Bash(HF_HUB_DISABLE_XET=1 /home/zhewenli/uv_env/vllm-fork/bin/python:*)",
+      "Bash(/home/zhewenli/uv_env/vllm-fork/bin/python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

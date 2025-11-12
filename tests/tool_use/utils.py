@@ -263,7 +263,17 @@ MESSAGES_WITHOUT_TOOLS: list[ChatCompletionMessageParam] = [
 ]
 
 MESSAGES_ASKING_FOR_TOOLS: list[ChatCompletionMessageParam] = [
-    {"role": "user", "content": "What is the weather in Dallas, Texas in Fahrenheit?"}
+    {
+        "role": "system",
+        "content": (
+            "You are a weather assistant with access to functions. Whenever the user "
+            "asks for the current weather, call the `get_current_weather` tool. "
+            "Provide JSON arguments containing the city name, the two-letter state "
+            "code, and set `unit` to \"fahrenheit\". Do not answer directly when the "
+            "tool can be used."
+        ),
+    },
+    {"role": "user", "content": "What is the weather in Dallas, Texas in Fahrenheit?"},
 ]
 
 MESSAGES_WITH_TOOL_RESPONSE: list[ChatCompletionMessageParam] = [

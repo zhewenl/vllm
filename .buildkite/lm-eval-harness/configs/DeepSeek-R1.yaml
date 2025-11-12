@@ -11,5 +11,15 @@ num_fewshot: 5
 trust_remote_code: True
 rtol: 0.05
 vllm_args:
-  enable_expert_parallel: true
-  gpu_memory_utilization: 0.95
+  # enable_expert_parallel: true
+  gpu_memory_utilization: 0.80
+env_vars:
+  VLLM_FP8_PADDING: 1
+  VLLM_FUSED_MOE_CHUNK_SIZE: 32768
+  VLLM_ROCM_USE_AITER: 1
+  VLLM_MLA_DISABLE: 0
+  VLLM_ROCM_USE_AITER_LINEAR: 0
+  VLLM_ROCM_USE_AITER_MHA: 0
+  VLLM_ROCM_USE_AITER_MLA: 1
+  VLLM_ROCM_USE_AITER_MOE: 1
+  VLLM_ROCM_USE_AITER_RMSNORM: 0

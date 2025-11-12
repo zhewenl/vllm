@@ -27,8 +27,7 @@ def launch_lm_eval(eval_config, tp_size):
     model_args_list = [
         f"pretrained={eval_config['model_name']}",
         f"tensor_parallel_size={tp_size}",
-        "enforce_eager={enforce_eager},"
-        f"kv_cache_dtype={kv_cache_dtype}",
+        f"enforce_eager={enforce_eager},kv_cache_dtype={kv_cache_dtype}",
         "add_bos_token=true",
         f"trust_remote_code={trust_remote_code}",
         f"max_model_len={max_model_len}",

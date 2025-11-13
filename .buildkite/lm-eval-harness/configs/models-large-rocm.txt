@@ -1,1 +1,1 @@
-DeepSeek-R1.yaml
+Meta-Llama-3-70B-Instruct.yaml

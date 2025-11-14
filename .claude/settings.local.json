@@ -23,7 +23,9 @@
       "Bash(PATH=/home/zhewenli/uv_env/vllm-fork/bin:$PATH HF_HUB_DISABLE_XET=1 wp:*)",
       "Bash(PATH=/home/zhewenli/uv_env/vllm-fork/bin:$PATH CC=/usr/lib64/ccache/gcc HF_HUB_DISABLE_XET=1 wp:*)",
       "Bash(HF_HUB_DISABLE_XET=1 /home/zhewenli/uv_env/vllm-fork/bin/python:*)",
-      "Bash(/home/zhewenli/uv_env/vllm-fork/bin/python:*)"
+      "Bash(/home/zhewenli/uv_env/vllm-fork/bin/python:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(rocm-smi:*)"
     ],
     "deny": [],
     "ask": []

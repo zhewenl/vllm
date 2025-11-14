@@ -126,6 +126,10 @@ When the user invokes this skill to analyze a CI failure:
 1. **ALWAYS use extended thinking (ultrathink)** for thorough analysis
 2. **Check for downloaded logs first**:
    - Look in `.claude/ci-logs/` for logs organized by date and platform
+   - **If user specifies a date/build option** (e.g., "yesterday", "latest", specific date):
+     - Check if logs exist in `.claude/ci-logs/<date>-<platform>-build-<number>/`
+     - If logs **DO NOT exist**, automatically invoke `vllm-ci-log-downloader` skill to download them first
+     - Wait for download to complete, then proceed with analysis
    - Read the `summary.md` file to understand available failures
    - Use existing logs if available
 3. **Identify the platform**: Is this ROCm (AMD), CUDA (NVIDIA), Torch Nightly, or other?

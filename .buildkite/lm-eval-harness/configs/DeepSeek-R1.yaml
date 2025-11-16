@@ -6,20 +6,21 @@ tasks:
   metrics:
   - name: "exact_match,custom-extract"
     value: 0.80
-limit: 2 # will run on 250 * 14 subjects = 3500 samples
+limit: 100 # will run on 250 * 14 subjects = 3500 samples
 num_fewshot: 5
 trust_remote_code: True
 rtol: 0.05
+max_model_len: 32768
+apply_chat_template: true
+fewshot_as_multiturn: true
+gen_kwargs: "temperature=0,top_p=1,top_k=0,max_gen_toks=5632,until=<|ENDANSWER|>"
 vllm_args:
-  # enable_expert_parallel: true
-  gpu_memory_utilization: 0.80
+  gpu_memory_utilization: 0.90
+  block_size: 1
 env_vars:
-  VLLM_FP8_PADDING: 1
-  VLLM_FUSED_MOE_CHUNK_SIZE: 32768
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
   VLLM_ROCM_USE_AITER: 1
-  VLLM_MLA_DISABLE: 0
-  VLLM_ROCM_USE_AITER_LINEAR: 0
-  VLLM_ROCM_USE_AITER_MHA: 0
   VLLM_ROCM_USE_AITER_MLA: 1
   VLLM_ROCM_USE_AITER_MOE: 1
-  VLLM_ROCM_USE_AITER_RMSNORM: 0
+  HSA_NO_SCRATCH_RECLAIM: 1
+  LLM_FUSED_MOE_CHUNK_SIZE: 32768

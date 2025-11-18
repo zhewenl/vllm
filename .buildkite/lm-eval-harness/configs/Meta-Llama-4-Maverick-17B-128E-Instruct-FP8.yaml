@@ -6,6 +6,20 @@ tasks:
   metrics:
   - name: "exact_match,custom-extract"
     value: 0.80
-# NOTE: lower samples for faster interation 
+# NOTE: lower samples for faster interation
 limit: 10 # will run on 250 * 14 subjects = 3500 samples
+max_model_len: 32768
 num_fewshot: 5
+vllm_args:
+  gpu_memory_utilization: 0.80
+env_vars:
+  SAFETENSORS_FAST_GPU: 1
+  TORCH_SHOW_CPP_STACKTRACES: 1
+  VLLM_DISABLE_COMPILE_CACHE: 1
+  VLLM_FP8_PADDING: 1
+  VLLM_ROCM_USE_AITER: 1
+  VLLM_ROCM_USE_AITER_LINEAR: 0
+  VLLM_ROCM_USE_AITER_MOE: 0
+  VLLM_ROCM_USE_AITER_RMSNORM: 0
+  VLLM_USE_V1: 1
+  VLLM_WORKER_MULTIPROC_METHOD: spawn

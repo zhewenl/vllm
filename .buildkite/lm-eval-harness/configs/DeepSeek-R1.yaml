@@ -6,7 +6,7 @@ tasks:
   metrics:
   - name: "exact_match,custom-extract"
     value: 0.80
-limit: 50 # will run on 250 * 14 subjects = 3500 samples
+limit: 250 # will run on 250 * 14 subjects = 3500 samples
 num_fewshot: 5
 trust_remote_code: true
 rtol: 0.05
@@ -14,7 +14,7 @@ max_model_len: 32768
 batch_size: 32
 # apply_chat_template: true
 # fewshot_as_multiturn: true
-# gen_kwargs: "max_gen_toks=5632"
+gen_kwargs: "max_gen_toks=5632"
 vllm_args:
   gpu_memory_utilization: 0.90
   block_size: 1

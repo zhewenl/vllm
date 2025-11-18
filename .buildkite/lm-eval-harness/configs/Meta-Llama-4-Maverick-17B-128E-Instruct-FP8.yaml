@@ -7,7 +7,7 @@ tasks:
   - name: "exact_match,custom-extract"
     value: 0.80
 # NOTE: lower samples for faster interation
-limit: 10 # will run on 250 * 14 subjects = 3500 samples
+limit: 250 # will run on 250 * 14 subjects = 3500 samples
 max_model_len: 32768
 num_fewshot: 5
 vllm_args:

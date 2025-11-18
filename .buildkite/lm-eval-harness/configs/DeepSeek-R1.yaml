@@ -11,17 +11,15 @@ num_fewshot: 5
 trust_remote_code: true
 rtol: 0.05
 max_model_len: 32768
-batch_size: 32
+# batch_size: 32
 # apply_chat_template: true
 # fewshot_as_multiturn: true
-gen_kwargs: "max_gen_toks=5632"
+# gen_kwargs: "max_gen_toks=5632"
 vllm_args:
   gpu_memory_utilization: 0.90
   block_size: 1
 env_vars:
   SAFETENSORS_FAST_GPU: 1
-  TORCH_SHOW_CPP_STACKTRACES: 1
-  VLLM_DISABLE_COMPILE_CACHE: 1
   VLLM_FP8_PADDING: 1
   VLLM_FUSED_MOE_CHUNK_SIZE: 32768
   VLLM_MLA_DISABLE: 0

@@ -48,6 +48,7 @@ def parser_with_config():
 def test_underscore_to_dash(parser):
     args = parser.parse_args(["--image_input_type", "pixel_values"])
     assert args.image_input_type == "pixel_values"
+    assert 0 == 1
 
 
 def test_mixed_usage(parser):

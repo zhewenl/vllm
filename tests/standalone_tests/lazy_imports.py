@@ -39,3 +39,5 @@ assert not any_module_imported(), (
     f"Some the modules in {module_names} are imported. To see the first"
     f" import location, run the test with `use_blame=True`."
 )
+
+assert 0 == 1  # This should fail the test.

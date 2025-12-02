@@ -180,12 +180,28 @@ class RemoteOpenAIServer:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        import time
+
+        print(f"[RemoteOpenAIServer] Shutting down server (PID: {self.proc.pid})")
+
         self.proc.terminate()
+        start_time = time.time()
+
         try:
+            # Increased timeout for large models on H200 to allow proper shutdown
+            # Workers need time to destroy NCCL process groups and free GPU memory
             self.proc.wait(30)
+            elapsed = time.time() - start_time
+            print(f"[RemoteOpenAIServer] Server exited cleanly after {elapsed:.2f}s")
         except subprocess.TimeoutExpired:
+            elapsed = time.time() - start_time
+            print(f"[RemoteOpenAIServer] TIMEOUT after {elapsed:.2f}s - force killing!")
             # force kill if needed
             self.proc.kill()
+
+        # Give GPU driver time to release memory after process death
+        time.sleep(3)
+        print("[RemoteOpenAIServer] Shutdown complete")
 
     def _poll(self) -> int | None:
         """Subclasses override this method to customize process polling"""

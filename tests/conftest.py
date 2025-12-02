@@ -1437,11 +1437,31 @@ def clean_gpu_memory_between_tests():
 
     # Wait for GPU memory to be cleared before starting the test
     import gc
+    import subprocess
+    import time
 
     from tests.utils import wait_for_gpu_memory_to_clear
 
     num_gpus = torch.cuda.device_count()
     if num_gpus > 0:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "python.*vllm"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            existing_pids = (
+                result.stdout.strip().split("\n") if result.stdout.strip() else []
+            )
+            if existing_pids and existing_pids[0]:
+                logger.warning(
+                    f"Found {len(existing_pids)} existing vllm processes: {existing_pids}"
+                )
+            else:
+                logger.info("No existing vllm processes found")
+        except Exception as e:
+            logger.debug(f"Process check failed: {e}")
         try:
             wait_for_gpu_memory_to_clear(
                 devices=list(range(num_gpus)),

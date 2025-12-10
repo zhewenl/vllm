@@ -11,13 +11,24 @@ num_fewshot: 5
 trust_remote_code: true
 rtol: 0.05
 max_model_len: 32768
-batch_size: 8
-# apply_chat_template: true
+batch_size: 16
+apply_chat_template: true
 # fewshot_as_multiturn: true
-gen_kwargs: "max_gen_toks=5632"
+# gen_kwargs: "max_gen_toks=5632"
 vllm_args:
   gpu_memory_utilization: 0.90
   block_size: 1
 env_vars:
+  SAFETENSORS_FAST_GPU: 1
+  VLLM_FP8_PADDING: 1
+  VLLM_FUSED_MOE_CHUNK_SIZE: 32768
+  VLLM_MLA_DISABLE: 0
   VLLM_ROCM_USE_AITER: 1
+  VLLM_ROCM_USE_AITER_LINEAR: 0
+  VLLM_ROCM_USE_AITER_MHA: 0
+  VLLM_ROCM_USE_AITER_MLA: 1
+  VLLM_ROCM_USE_AITER_MOE: 1
+  VLLM_ROCM_USE_AITER_RMSNORM: 0
+  VLLM_USE_TRITON_FLASH_ATTN: 1
+  VLLM_USE_ROCM_FP8_FLASH_ATTN: 0
   VLLM_WORKER_MULTIPROC_METHOD: spawn

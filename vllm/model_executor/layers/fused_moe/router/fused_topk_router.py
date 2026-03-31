@@ -100,7 +100,8 @@ def fused_topk(
             use_rocm_aiter=rocm_aiter_ops.is_fused_moe_enabled()
         )
         topk_weights, topk_ids = topk_func(
-            topk_weights, topk_ids, token_expert_indices, gating_output, renormalize
+            topk_weights, topk_ids, token_expert_indices, gating_output,
+            renormalize, enable_pdl=True,
         )
 
         return topk_weights, topk_ids, token_expert_indices
@@ -109,7 +110,8 @@ def fused_topk(
             use_rocm_aiter=rocm_aiter_ops.is_fused_moe_enabled()
         )
         topk_weights, topk_ids = topk_func(
-            topk_weights, topk_ids, token_expert_indices, gating_output, renormalize
+            topk_weights, topk_ids, token_expert_indices, gating_output,
+            renormalize, enable_pdl=True,
         )
 
         return topk_weights, topk_ids, token_expert_indices

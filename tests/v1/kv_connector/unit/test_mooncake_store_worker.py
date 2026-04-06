@@ -3,7 +3,9 @@
 
 import math
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
     mooncake_store_worker,
@@ -345,3 +347,199 @@ def test_recv_thread_reports_unsplittable_key_larger_than_budget():
     thread._handle_request(req)
 
     assert store.batch_get_into_multi_buffers.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Helpers for register_kv_caches tests
+# ---------------------------------------------------------------------------
+
+
+def _auto_set_ready_event(*args, **kwargs):
+    """Side effect for mocked thread constructors that auto-sets ready_event."""
+    for arg in args:
+        if isinstance(arg, threading.Event):
+            arg.set()
+    for val in kwargs.values():
+        if isinstance(val, threading.Event):
+            val.set()
+    return MagicMock()
+
+
+def _make_bare_worker(
+    *,
+    num_gpu_blocks: int = 10,
+    block_size: int = 16,
+    kv_role: str = "kv_both",
+) -> mooncake_store_worker.MooncakeStoreWorker:
+    """Construct a MooncakeStoreWorker via __new__, bypassing __init__.
+
+    Sets only the attributes that register_kv_caches() reads so we can
+    test the stride-based layout detection without a real
+    MooncakeDistributedStore.
+    """
+    worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
+    worker.cache_config = MagicMock()
+    worker.cache_config.num_gpu_blocks = num_gpu_blocks
+    worker.store = MagicMock()
+    worker.store.register_buffer.return_value = 0
+    worker.use_mla = False
+    worker.token_database = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0), block_size=block_size
+    )
+    worker.kv_role = kv_role
+    worker.block_size = block_size
+    worker.tp_rank = 0
+    worker.put_step = 1
+    worker.enable_kv_events = False
+    worker.disk_offload_buffer_budget_bytes = None
+    worker.kv_send_thread = None
+    worker.kv_recv_thread = None
+    return worker
+
+
+# ---------------------------------------------------------------------------
+# register_kv_caches tests
+# ---------------------------------------------------------------------------
+
+
+def test_register_kv_caches_blocks_first_single_segment():
+    """Blocks-first layout (FlashInfer/MLA): one segment per layer."""
+    num_blocks = 10
+    page_size_elements = 64  # elements per block
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+
+    # Shape: (num_blocks, page_size_elements) — blocks outermost, no outer_dims
+    tensor = torch.zeros(num_blocks, page_size_elements, dtype=torch.float16)
+
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_worker.KVCacheStoreSendingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_worker.KVCacheStoreRecvingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+    ):
+        worker.register_kv_caches({"layer0": tensor})
+
+    assert len(worker.kv_caches_base_addr) == 1
+    assert worker.kv_caches_base_addr[0] == tensor.untyped_storage().data_ptr()
+
+    expected_block_len = tensor.untyped_storage().nbytes() // num_blocks
+    assert len(worker.block_len) == 1
+    assert worker.block_len[0] == expected_block_len
+
+    worker.store.register_buffer.assert_called_once_with(
+        tensor.untyped_storage().data_ptr(),
+        tensor.untyped_storage().nbytes(),
+    )
+
+
+def test_register_kv_caches_kv_first_two_segments():
+    """K/V-first layout (FlashAttn): two segments (K, V) per layer."""
+    num_blocks = 10
+    block_size_tokens = 16
+    num_kv_heads = 4
+    head_size = 8
+
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+
+    # Shape: (2, num_blocks, block_size, num_kv_heads, head_size) — K/V outermost
+    tensor = torch.zeros(
+        2,
+        num_blocks,
+        block_size_tokens,
+        num_kv_heads,
+        head_size,
+        dtype=torch.float16,
+    )
+
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_worker.KVCacheStoreSendingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_worker.KVCacheStoreRecvingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+    ):
+        worker.register_kv_caches({"layer0": tensor})
+
+    # K/V-first: dim 0 has stride > page_size, so 2 segments
+    assert len(worker.kv_caches_base_addr) == 2
+    assert len(worker.block_len) == 2
+
+    el = tensor.element_size()
+    seg_stride = tensor.stride(0) * el  # stride of the K/V dim in bytes
+    base = tensor.untyped_storage().data_ptr()
+    assert worker.kv_caches_base_addr[0] == base
+    assert worker.kv_caches_base_addr[1] == base + seg_stride
+    assert worker.block_len[0] == seg_stride // num_blocks
+    assert worker.block_len[1] == seg_stride // num_blocks
+
+
+def test_register_kv_caches_cross_layer_single_segment():
+    """Cross-layer tensor: single segment with block_len = page_size * num_layers."""
+    num_blocks = 10
+    num_layers = 4
+    per_layer_page_elements = 64  # elements per layer per block
+
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+
+    # Cross-layer blocks-first tensor: all layers packed into a single
+    # contiguous block.  Shape (num_blocks, num_layers * per_layer_page)
+    # mimics the physical layout after stride reordering.
+    total_page_elements = num_layers * per_layer_page_elements
+    tensor = torch.zeros(num_blocks, total_page_elements, dtype=torch.float16)
+
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_worker.KVCacheStoreSendingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_worker.KVCacheStoreRecvingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+    ):
+        # Use the cross-layer wrapper key, same as register_cross_layers_kv_caches
+        worker.register_kv_caches({"__cross_layer__": tensor})
+
+    assert len(worker.kv_caches_base_addr) == 1
+    assert worker.kv_caches_base_addr[0] == tensor.untyped_storage().data_ptr()
+
+    expected_block_len = tensor.untyped_storage().nbytes() // num_blocks
+    # block_len should be per_layer_page_size * num_layers
+    assert (
+        expected_block_len
+        == num_layers * per_layer_page_elements * tensor.element_size()
+    )
+    assert len(worker.block_len) == 1
+    assert worker.block_len[0] == expected_block_len
+
+    # Also verify via register_cross_layers_kv_caches wrapper
+    worker2 = _make_bare_worker(num_gpu_blocks=num_blocks)
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_worker.KVCacheStoreSendingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_store_worker.KVCacheStoreRecvingThread",
+            side_effect=_auto_set_ready_event,
+        ),
+    ):
+        worker2.register_cross_layers_kv_caches(tensor)
+
+    assert worker2.kv_caches_base_addr == worker.kv_caches_base_addr
+    assert worker2.block_len == worker.block_len

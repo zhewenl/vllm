@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
     mooncake_store_connector,
+    mooncake_store_scheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (
     MooncakeStoreConnectorMetadata,
@@ -117,6 +118,27 @@ def test_worker_role_skips_lookup_server_on_nonzero_rank():
 
     mock_worker.assert_called_once_with(vllm_config)
     mock_lookup_server.assert_not_called()
+
+
+def test_lookup_rpc_path_uses_data_parallel_index_in_dense_dp():
+    vllm_config = _make_vllm_config()
+    vllm_config.parallel_config.data_parallel_rank = 0
+    vllm_config.parallel_config.data_parallel_index = 3
+
+    path = mooncake_store_scheduler.get_zmq_rpc_path_lookup(vllm_config)
+
+    assert path.endswith("_dp_rank3")
+
+
+def test_lookup_rpc_path_uses_local_rank_when_local_engines_only():
+    vllm_config = _make_vllm_config()
+    vllm_config.parallel_config.data_parallel_index = 7
+    vllm_config.parallel_config.data_parallel_rank_local = 1
+    vllm_config.parallel_config.data_parallel_hybrid_lb = True
+
+    path = mooncake_store_scheduler.get_zmq_rpc_path_lookup(vllm_config)
+
+    assert path.endswith("_dp_rank1")
 
 
 def test_worker_methods_delegate_to_store_worker():

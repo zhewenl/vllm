@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import math
+import sys
 import threading
+import types
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -20,6 +24,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data i
 
 def _make_store_sending_thread(
     store: MagicMock,
+    *,
+    replicate_config: object | None = None,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     token_database = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0), block_size=16
@@ -34,6 +40,7 @@ def _make_store_sending_thread(
         put_step=1,
         kv_role="kv_producer",
         ready_event=threading.Event(),
+        replicate_config=replicate_config,
     )
     thread.request_queue.task_done = MagicMock()
     return thread
@@ -106,6 +113,241 @@ _DISK_OFFLOAD_BUDGET_TOO_SMALL = (
 )  # Smaller than a single 256-byte chunk.
 
 
+class _FakeResponse:
+    def __init__(self, payload: str):
+        self._payload = payload.encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+class _FakeKVTransferConfig:
+    def __init__(
+        self,
+        *,
+        kv_role: str = "kv_both",
+        extra_config: dict[str, object] | None = None,
+    ) -> None:
+        self.kv_role = kv_role
+        self.kv_connector_extra_config = extra_config or {}
+
+    def get_from_extra_config(self, key: str, default: object) -> object:
+        return self.kv_connector_extra_config.get(key, default)
+
+
+class _FakeModelConfig:
+    model = "test-model"
+    use_mla = False
+
+    def get_num_layers(self, parallel_config) -> int:
+        return 1
+
+    def get_total_num_kv_heads(self) -> int:
+        return 1
+
+
+def _make_vllm_config(
+    *, extra_config: dict[str, object] | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=_FakeModelConfig(),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            rank=0,
+        ),
+        kv_transfer_config=_FakeKVTransferConfig(extra_config=extra_config),
+        cache_config=SimpleNamespace(block_size=16, num_gpu_blocks=10),
+        kv_events_config=SimpleNamespace(enable_kv_cache_events=False),
+    )
+
+
+def _write_mooncake_config(tmp_path, config: dict[str, object]) -> str:
+    config_path = tmp_path / "mooncake_config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    return str(config_path)
+
+
+def _install_fake_mooncake(monkeypatch, store_instance: MagicMock):
+    class FakeReplicateConfig:
+        def __init__(self) -> None:
+            self.preferred_segment = ""
+
+    fake_store_module = types.ModuleType("mooncake.store")
+    fake_store_module.MooncakeDistributedStore = lambda: store_instance  # type: ignore[attr-defined]
+    fake_store_module.ReplicateConfig = FakeReplicateConfig  # type: ignore[attr-defined]
+    fake_mooncake_module = types.ModuleType("mooncake")
+    fake_mooncake_module.store = fake_store_module  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mooncake", fake_mooncake_module)
+    monkeypatch.setitem(sys.modules, "mooncake.store", fake_store_module)
+    return FakeReplicateConfig
+
+
+def _patch_worker_runtime(monkeypatch, *, local_ip: str = "10.0.0.7") -> None:
+    single_rank_group = SimpleNamespace(world_size=1, rank_in_group=0)
+    monkeypatch.setattr(
+        mooncake_store_worker, "get_mooncake_dp_engine_index", lambda _: 0
+    )
+    monkeypatch.setattr(
+        mooncake_store_worker, "get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        mooncake_store_worker, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        mooncake_store_worker, "get_pcp_group", lambda: single_rank_group
+    )
+    monkeypatch.setattr(
+        mooncake_store_worker, "get_dcp_group", lambda: single_rank_group
+    )
+    monkeypatch.setattr(mooncake_store_worker, "get_ip", lambda: local_ip)
+
+
+def test_derive_master_admin_endpoint_from_mooncake_master():
+    assert (
+        mooncake_store_worker._derive_master_admin_endpoint("10.0.0.7:50051")
+        == "http://10.0.0.7:9003/get_all_segments"
+    )
+
+
+def test_get_master_admin_endpoint_prefers_connector_override():
+    extra_config = {"master_admin_endpoint": "http://override:9003/get_all_segments"}
+
+    assert (
+        mooncake_store_worker._get_master_admin_endpoint(
+            extra_config,
+            "10.0.0.7:50051",
+        )
+        == "http://override:9003/get_all_segments"
+    )
+
+
+def test_get_requester_local_buffer_size_uses_requester_default():
+    assert (
+        mooncake_store_worker._get_requester_local_buffer_size({})
+        == mooncake_store_worker.DEFAULT_REQUESTER_LOCAL_BUFFER_SIZE
+    )
+
+
+def test_get_kv_connector_extra_config_value_reads_extra_config():
+    vllm_config = _make_vllm_config(extra_config={"preferred_segment": "node-a:50053"})
+
+    assert (
+        mooncake_store_worker._get_kv_connector_extra_config_value(
+            vllm_config,
+            "preferred_segment",
+        )
+        == "node-a:50053"
+    )
+
+
+def test_resolve_preferred_segment_prefers_explicit_override():
+    urlopen_calls: list[str] = []
+
+    def _unexpected_urlopen(*args, **kwargs):
+        urlopen_calls.append(args[0])
+        raise AssertionError("preferred_segment override should bypass discovery")
+
+    preferred_segment, warning = mooncake_store_worker._resolve_preferred_segment(
+        {"preferred_segment": "10.0.0.7:50053"},
+        "10.0.0.7:50051",
+        "10.0.0.7",
+        {"worker-a"},
+        urlopen_impl=_unexpected_urlopen,
+    )
+
+    assert preferred_segment == "10.0.0.7:50053"
+    assert warning is None
+    assert urlopen_calls == []
+
+
+def test_resolve_preferred_segment_uses_master_admin_endpoint_override():
+    called_urls: list[str] = []
+
+    def _fake_urlopen(url: str, timeout: float):
+        called_urls.append(url)
+        return _FakeResponse("10.0.0.7:50053\n")
+
+    preferred_segment, warning = mooncake_store_worker._resolve_preferred_segment(
+        {"master_admin_endpoint": "http://override:9003/get_all_segments"},
+        "10.0.0.7:50051",
+        "10.0.0.7",
+        {"worker-a"},
+        urlopen_impl=_fake_urlopen,
+    )
+
+    assert preferred_segment == "10.0.0.7:50053"
+    assert warning is None
+    assert called_urls == ["http://override:9003/get_all_segments"]
+
+
+def test_resolve_preferred_segment_uses_derived_admin_endpoint():
+    called_urls: list[str] = []
+
+    def _fake_urlopen(url: str, timeout: float):
+        called_urls.append(url)
+        return _FakeResponse("10.0.0.7:50053\n")
+
+    preferred_segment, warning = mooncake_store_worker._resolve_preferred_segment(
+        {},
+        "10.0.0.7:50051",
+        "10.0.0.7",
+        {"worker-a"},
+        urlopen_impl=_fake_urlopen,
+    )
+
+    assert preferred_segment == "10.0.0.7:50053"
+    assert warning is None
+    assert called_urls == ["http://10.0.0.7:9003/get_all_segments"]
+
+
+def test_discovery_prefers_exact_ip_match():
+    preferred_segment, warning = mooncake_store_worker._discover_preferred_segment(
+        "http://master:9003/get_all_segments",
+        "10.0.0.7",
+        {"worker-a"},
+        urlopen_impl=lambda *_args, **_kwargs: _FakeResponse(
+            "worker-a:50053\n10.0.0.7:50053\n"
+        ),
+    )
+
+    assert preferred_segment == "10.0.0.7:50053"
+    assert warning is None
+
+
+def test_discovery_uses_hostname_fallback_only_when_exact_ip_missing():
+    preferred_segment, warning = mooncake_store_worker._discover_preferred_segment(
+        "http://master:9003/get_all_segments",
+        "10.0.0.7",
+        {"worker-a"},
+        urlopen_impl=lambda *_args, **_kwargs: _FakeResponse(
+            "worker-a:50053\n10.0.0.8:50053\n"
+        ),
+    )
+
+    assert preferred_segment == "worker-a:50053"
+    assert warning is None
+
+
+def test_discovery_returns_none_for_ambiguous_local_matches():
+    preferred_segment, warning = mooncake_store_worker._discover_preferred_segment(
+        "http://master:9003/get_all_segments",
+        "10.0.0.7",
+        {"worker-a"},
+        urlopen_impl=lambda *_args, **_kwargs: _FakeResponse(
+            "10.0.0.7:50053\n10.0.0.7:50054\n"
+        ),
+    )
+
+    assert preferred_segment is None
+    assert "multiple exact IP matches" in warning
+
+
 def test_store_sending_thread_skips_request_during_cpu_pressure():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
@@ -163,21 +405,52 @@ def test_store_sending_thread_only_skips_on_no_available_handle():
     assert store.batch_put_from_multi_buffers.call_count == 2
 
 
-def test_get_disk_offload_buffer_budget_bytes_uses_effective_offload_flag(
+def test_store_sending_thread_passes_replicate_config_when_preferred_segment_set():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    replicate_config = SimpleNamespace(preferred_segment="10.0.0.7:50053")
+    thread = _make_store_sending_thread(store, replicate_config=replicate_config)
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
+
+    assert store.batch_put_from_multi_buffers.call_count == 1
+    call_args = store.batch_put_from_multi_buffers.call_args.args
+    assert len(call_args) == 4
+    assert call_args[3] is replicate_config
+
+
+def test_store_sending_thread_uses_default_write_path_without_preferred_segment():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    thread = _make_store_sending_thread(store)
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
+
+    assert store.batch_put_from_multi_buffers.call_count == 1
+    call_args = store.batch_put_from_multi_buffers.call_args.args
+    assert len(call_args) == 3
+
+
+def test_get_disk_offload_buffer_budget_bytes_uses_requester_budget_override(
     monkeypatch,
 ):
-    monkeypatch.delenv("MOONCAKE_ENABLE_OFFLOAD", raising=False)
     monkeypatch.setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "2mb")
 
     assert (
-        mooncake_store_worker._get_disk_offload_buffer_budget_bytes(enable_offload=True)
-        == 2 * 1024 * 1024
+        mooncake_store_worker._get_disk_offload_buffer_budget_bytes() == 2 * 1024 * 1024
     )
+
+
+def test_get_disk_offload_buffer_budget_bytes_uses_requester_default(monkeypatch):
+    monkeypatch.delenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", raising=False)
+
     assert (
-        mooncake_store_worker._get_disk_offload_buffer_budget_bytes(
-            enable_offload=False
-        )
-        is None
+        mooncake_store_worker._get_disk_offload_buffer_budget_bytes()
+        == mooncake_store_worker.DEFAULT_MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE
     )
 
 
@@ -347,6 +620,111 @@ def test_recv_thread_reports_unsplittable_key_larger_than_budget():
     thread._handle_request(req)
 
     assert store.batch_get_into_multi_buffers.call_count == 0
+
+
+def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
+    store = MagicMock()
+    store.setup.return_value = 0
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_resolve_preferred_segment",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setenv(
+        "MOONCAKE_CONFIG_PATH",
+        _write_mooncake_config(
+            tmp_path,
+            {
+                "metadata_server": "http://metadata/endpoint",
+                "global_segment_size": "4gb",
+                "local_buffer_size": "64mb",
+                "protocol": "rdma",
+                "device_name": "mlx5_0",
+                "master_server_address": "10.0.0.7:50051",
+                "enable_offload": True,
+            },
+        ),
+    )
+
+    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+
+    assert not hasattr(worker, "_isolate_offload_resources")
+    assert store.setup.call_args.args == (
+        "10.0.0.7",
+        "http://metadata/endpoint",
+        0,
+        64 * 1024 * 1024,
+        "rdma",
+        "mlx5_0",
+        "10.0.0.7:50051",
+    )
+
+
+def test_requester_worker_init_preserves_disk_budget_without_offload_ownership(
+    tmp_path,
+    monkeypatch,
+):
+    store = MagicMock()
+    store.setup.return_value = 0
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_resolve_preferred_segment",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "4mb")
+    monkeypatch.setenv(
+        "MOONCAKE_CONFIG_PATH",
+        _write_mooncake_config(
+            tmp_path,
+            {
+                "metadata_server": "http://metadata/endpoint",
+                "protocol": "tcp",
+                "device_name": "",
+                "master_server_address": "10.0.0.7:50051",
+                "enable_offload": False,
+            },
+        ),
+    )
+
+    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+
+    assert worker.disk_offload_buffer_budget_bytes == 4 * 1024 * 1024
+
+
+def test_requester_worker_init_builds_replicate_config_for_preferred_segment(
+    tmp_path,
+    monkeypatch,
+):
+    store = MagicMock()
+    store.setup.return_value = 0
+    fake_replicate_config_cls = _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_resolve_preferred_segment",
+        lambda *args, **kwargs: ("10.0.0.7:50053", None),
+    )
+    monkeypatch.setenv(
+        "MOONCAKE_CONFIG_PATH",
+        _write_mooncake_config(
+            tmp_path,
+            {
+                "metadata_server": "http://metadata/endpoint",
+                "protocol": "tcp",
+                "device_name": "",
+                "master_server_address": "10.0.0.7:50051",
+            },
+        ),
+    )
+
+    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+
+    assert isinstance(worker.store_replicate_config, fake_replicate_config_cls)
+    assert worker.store_replicate_config.preferred_segment == "10.0.0.7:50053"
 
 
 # ---------------------------------------------------------------------------

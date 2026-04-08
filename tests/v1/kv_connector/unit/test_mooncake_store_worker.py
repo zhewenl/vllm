@@ -234,6 +234,15 @@ def test_get_requester_local_buffer_size_uses_requester_default():
     )
 
 
+def test_get_requester_local_hostname_prefers_override(monkeypatch):
+    monkeypatch.setenv("MOONCAKE_LOCAL_HOSTNAME", "worker-a:50053")
+
+    assert (
+        mooncake_store_worker._get_requester_local_hostname("10.0.0.7")
+        == "worker-a:50053"
+    )
+
+
 def test_get_kv_connector_extra_config_value_reads_extra_config():
     vllm_config = _make_vllm_config(extra_config={"preferred_segment": "node-a:50053"})
 
@@ -660,6 +669,39 @@ def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
         "mlx5_0",
         "10.0.0.7:50051",
     )
+
+
+def test_requester_worker_init_prefers_local_hostname_override(
+    tmp_path,
+    monkeypatch,
+):
+    store = MagicMock()
+    store.setup.return_value = 0
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_resolve_preferred_segment",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setenv("MOONCAKE_LOCAL_HOSTNAME", "worker-a:50053")
+    monkeypatch.setenv(
+        "MOONCAKE_CONFIG_PATH",
+        _write_mooncake_config(
+            tmp_path,
+            {
+                "metadata_server": "http://metadata/endpoint",
+                "local_buffer_size": "64mb",
+                "protocol": "tcp",
+                "device_name": "",
+                "master_server_address": "10.0.0.7:50051",
+            },
+        ),
+    )
+
+    mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+
+    assert store.setup.call_args.args[0] == "worker-a:50053"
 
 
 def test_requester_worker_init_preserves_disk_budget_without_offload_ownership(

@@ -125,9 +125,14 @@ def test_lookup_rpc_path_uses_data_parallel_index_in_dense_dp():
     vllm_config.parallel_config.data_parallel_rank = 0
     vllm_config.parallel_config.data_parallel_index = 3
 
-    path = mooncake_store_scheduler.get_zmq_rpc_path_lookup(vllm_config)
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+        "mooncake_store_scheduler.socket.gethostname",
+        return_value="node-a",
+    ):
+        path = mooncake_store_scheduler.get_zmq_rpc_path_lookup(vllm_config)
 
-    assert path.endswith("_dp_rank3")
+    assert path.endswith("_host_node-a_dp_rank3")
 
 
 def test_lookup_rpc_path_uses_local_rank_when_local_engines_only():
@@ -136,9 +141,14 @@ def test_lookup_rpc_path_uses_local_rank_when_local_engines_only():
     vllm_config.parallel_config.data_parallel_rank_local = 1
     vllm_config.parallel_config.data_parallel_hybrid_lb = True
 
-    path = mooncake_store_scheduler.get_zmq_rpc_path_lookup(vllm_config)
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+        "mooncake_store_scheduler.socket.gethostname",
+        return_value="node-b",
+    ):
+        path = mooncake_store_scheduler.get_zmq_rpc_path_lookup(vllm_config)
 
-    assert path.endswith("_dp_rank1")
+    assert path.endswith("_host_node-b_dp_rank1")
 
 
 def test_worker_methods_delegate_to_store_worker():

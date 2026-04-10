@@ -9,6 +9,7 @@ import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
@@ -113,20 +114,6 @@ _DISK_OFFLOAD_BUDGET_TOO_SMALL = (
 )  # Smaller than a single 256-byte chunk.
 
 
-class _FakeResponse:
-    def __init__(self, payload: str):
-        self._payload = payload.encode("utf-8")
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        return False
-
-    def read(self) -> bytes:
-        return self._payload
-
-
 class _FakeKVTransferConfig:
     def __init__(
         self,
@@ -208,25 +195,6 @@ def _patch_worker_runtime(monkeypatch, *, local_ip: str = "10.0.0.7") -> None:
     monkeypatch.setattr(mooncake_store_worker, "get_ip", lambda: local_ip)
 
 
-def test_derive_master_admin_endpoint_from_mooncake_master():
-    assert (
-        mooncake_store_worker._derive_master_admin_endpoint("10.0.0.7:50051")
-        == "http://10.0.0.7:9003/get_all_segments"
-    )
-
-
-def test_get_master_admin_endpoint_prefers_connector_override():
-    extra_config = {"master_admin_endpoint": "http://override:9003/get_all_segments"}
-
-    assert (
-        mooncake_store_worker._get_master_admin_endpoint(
-            extra_config,
-            "10.0.0.7:50051",
-        )
-        == "http://override:9003/get_all_segments"
-    )
-
-
 def test_get_requester_local_buffer_size_uses_requester_default():
     assert (
         mooncake_store_worker._get_requester_local_buffer_size({})
@@ -243,118 +211,128 @@ def test_get_requester_local_hostname_prefers_override(monkeypatch):
     )
 
 
-def test_get_kv_connector_extra_config_value_reads_extra_config():
-    vllm_config = _make_vllm_config(extra_config={"preferred_segment": "node-a:50053"})
+def test_get_configured_preferred_segment_returns_explicit_override():
+    assert (
+        mooncake_store_worker._get_configured_preferred_segment(
+            {"preferred_segment": "10.0.0.7:50053"}
+        )
+        == "10.0.0.7:50053"
+    )
+
+
+def test_get_configured_preferred_segment_rejects_empty_override():
+    with pytest.raises(ValueError, match="preferred_segment"):
+        mooncake_store_worker._get_configured_preferred_segment(
+            {"preferred_segment": "  "}
+        )
+
+
+def test_get_configured_worker_rnic_prefers_explicit_device_name(monkeypatch):
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_get_current_cuda_pci_bus_id",
+        lambda: "00000000:89:00.0",
+    )
+    store_config = mooncake_store_worker.MooncakeStoreConfig(
+        metadata_server="",
+        requester_local_buffer_size=1,
+        protocol="rdma",
+        device_name="rocep139s0",
+        master_server_address="",
+    )
 
     assert (
-        mooncake_store_worker._get_kv_connector_extra_config_value(
-            vllm_config,
-            "preferred_segment",
+        mooncake_store_worker._get_configured_worker_rnic(store_config, {})
+        == "rocep139s0"
+    )
+
+
+def test_get_configured_worker_rnic_requires_map_for_rdma(monkeypatch):
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_get_current_cuda_pci_bus_id",
+        lambda: "00000000:89:00.0",
+    )
+    store_config = mooncake_store_worker.MooncakeStoreConfig(
+        metadata_server="",
+        requester_local_buffer_size=1,
+        protocol="rdma",
+        device_name="",
+        master_server_address="",
+    )
+
+    with pytest.raises(ValueError, match="gpu_bdf_rnic_map"):
+        mooncake_store_worker._get_configured_worker_rnic(store_config, {})
+
+
+def test_get_configured_worker_rnic_rejects_non_full_bdf_keys(monkeypatch):
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_get_current_cuda_pci_bus_id",
+        lambda: "00000000:89:00.0",
+    )
+    store_config = mooncake_store_worker.MooncakeStoreConfig(
+        metadata_server="",
+        requester_local_buffer_size=1,
+        protocol="rdma",
+        device_name="",
+        master_server_address="",
+    )
+
+    with pytest.raises(ValueError, match="full GPU PCI BDFs"):
+        mooncake_store_worker._get_configured_worker_rnic(
+            store_config,
+            {"gpu_bdf_rnic_map": {"89:00.0": "rocep139s0"}},
         )
-        == "node-a:50053"
+
+
+def test_get_configured_worker_rnic_uses_matching_local_gpu_bdf(monkeypatch):
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_get_current_cuda_pci_bus_id",
+        lambda: "00000000:c2:00.0",
+    )
+    store_config = mooncake_store_worker.MooncakeStoreConfig(
+        metadata_server="",
+        requester_local_buffer_size=1,
+        protocol="rdma",
+        device_name="",
+        master_server_address="",
+    )
+
+    assert (
+        mooncake_store_worker._get_configured_worker_rnic(
+            store_config,
+            {
+                "gpu_bdf_rnic_map": {
+                    "00000000:89:00.0": "rocep139s0",
+                    "00000000:c2:00.0": "rocep196s0",
+                }
+            },
+        )
+        == "rocep196s0"
     )
 
 
-def test_resolve_preferred_segment_prefers_explicit_override():
-    urlopen_calls: list[str] = []
-
-    def _unexpected_urlopen(*args, **kwargs):
-        urlopen_calls.append(args[0])
-        raise AssertionError("preferred_segment override should bypass discovery")
-
-    preferred_segment, warning = mooncake_store_worker._resolve_preferred_segment(
-        {"preferred_segment": "10.0.0.7:50053"},
-        "10.0.0.7:50051",
-        "10.0.0.7",
-        {"worker-a"},
-        urlopen_impl=_unexpected_urlopen,
+def test_get_configured_worker_rnic_rejects_missing_local_gpu_entry(monkeypatch):
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_get_current_cuda_pci_bus_id",
+        lambda: "00000000:c2:00.0",
+    )
+    store_config = mooncake_store_worker.MooncakeStoreConfig(
+        metadata_server="",
+        requester_local_buffer_size=1,
+        protocol="rdma",
+        device_name="",
+        master_server_address="",
     )
 
-    assert preferred_segment == "10.0.0.7:50053"
-    assert warning is None
-    assert urlopen_calls == []
-
-
-def test_resolve_preferred_segment_uses_master_admin_endpoint_override():
-    called_urls: list[str] = []
-
-    def _fake_urlopen(url: str, timeout: float):
-        called_urls.append(url)
-        return _FakeResponse("10.0.0.7:50053\n")
-
-    preferred_segment, warning = mooncake_store_worker._resolve_preferred_segment(
-        {"master_admin_endpoint": "http://override:9003/get_all_segments"},
-        "10.0.0.7:50051",
-        "10.0.0.7",
-        {"worker-a"},
-        urlopen_impl=_fake_urlopen,
-    )
-
-    assert preferred_segment == "10.0.0.7:50053"
-    assert warning is None
-    assert called_urls == ["http://override:9003/get_all_segments"]
-
-
-def test_resolve_preferred_segment_uses_derived_admin_endpoint():
-    called_urls: list[str] = []
-
-    def _fake_urlopen(url: str, timeout: float):
-        called_urls.append(url)
-        return _FakeResponse("10.0.0.7:50053\n")
-
-    preferred_segment, warning = mooncake_store_worker._resolve_preferred_segment(
-        {},
-        "10.0.0.7:50051",
-        "10.0.0.7",
-        {"worker-a"},
-        urlopen_impl=_fake_urlopen,
-    )
-
-    assert preferred_segment == "10.0.0.7:50053"
-    assert warning is None
-    assert called_urls == ["http://10.0.0.7:9003/get_all_segments"]
-
-
-def test_discovery_prefers_exact_ip_match():
-    preferred_segment, warning = mooncake_store_worker._discover_preferred_segment(
-        "http://master:9003/get_all_segments",
-        "10.0.0.7",
-        {"worker-a"},
-        urlopen_impl=lambda *_args, **_kwargs: _FakeResponse(
-            "worker-a:50053\n10.0.0.7:50053\n"
-        ),
-    )
-
-    assert preferred_segment == "10.0.0.7:50053"
-    assert warning is None
-
-
-def test_discovery_uses_hostname_fallback_only_when_exact_ip_missing():
-    preferred_segment, warning = mooncake_store_worker._discover_preferred_segment(
-        "http://master:9003/get_all_segments",
-        "10.0.0.7",
-        {"worker-a"},
-        urlopen_impl=lambda *_args, **_kwargs: _FakeResponse(
-            "worker-a:50053\n10.0.0.8:50053\n"
-        ),
-    )
-
-    assert preferred_segment == "worker-a:50053"
-    assert warning is None
-
-
-def test_discovery_returns_none_for_ambiguous_local_matches():
-    preferred_segment, warning = mooncake_store_worker._discover_preferred_segment(
-        "http://master:9003/get_all_segments",
-        "10.0.0.7",
-        {"worker-a"},
-        urlopen_impl=lambda *_args, **_kwargs: _FakeResponse(
-            "10.0.0.7:50053\n10.0.0.7:50054\n"
-        ),
-    )
-
-    assert preferred_segment is None
-    assert "multiple exact IP matches" in warning
+    with pytest.raises(ValueError, match="does not contain the local GPU PCI BDF"):
+        mooncake_store_worker._get_configured_worker_rnic(
+            store_config,
+            {"gpu_bdf_rnic_map": {"00000000:89:00.0": "rocep139s0"}},
+        )
 
 
 def test_store_sending_thread_skips_request_during_cpu_pressure():
@@ -636,11 +614,6 @@ def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
     _patch_worker_runtime(monkeypatch)
-    monkeypatch.setattr(
-        mooncake_store_worker,
-        "_resolve_preferred_segment",
-        lambda *args, **kwargs: (None, None),
-    )
     monkeypatch.setenv(
         "MOONCAKE_CONFIG_PATH",
         _write_mooncake_config(
@@ -656,8 +629,17 @@ def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
             },
         ),
     )
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_get_current_cuda_pci_bus_id",
+        lambda: "00000000:89:00.0",
+    )
 
-    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+    worker = mooncake_store_worker.MooncakeStoreWorker(
+        _make_vllm_config(
+            extra_config={"gpu_bdf_rnic_map": {"00000000:89:00.0": "rocep139s0"}}
+        )
+    )
 
     assert not hasattr(worker, "_isolate_offload_resources")
     assert store.setup.call_args.args == (
@@ -679,11 +661,6 @@ def test_requester_worker_init_prefers_local_hostname_override(
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
     _patch_worker_runtime(monkeypatch)
-    monkeypatch.setattr(
-        mooncake_store_worker,
-        "_resolve_preferred_segment",
-        lambda *args, **kwargs: (None, None),
-    )
     monkeypatch.setenv("MOONCAKE_LOCAL_HOSTNAME", "worker-a:50053")
     monkeypatch.setenv(
         "MOONCAKE_CONFIG_PATH",
@@ -698,8 +675,17 @@ def test_requester_worker_init_prefers_local_hostname_override(
             },
         ),
     )
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_get_current_cuda_pci_bus_id",
+        lambda: "00000000:89:00.0",
+    )
 
-    mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+    mooncake_store_worker.MooncakeStoreWorker(
+        _make_vllm_config(
+            extra_config={"gpu_bdf_rnic_map": {"00000000:89:00.0": "rocep139s0"}}
+        )
+    )
 
     assert store.setup.call_args.args[0] == "worker-a:50053"
 
@@ -712,11 +698,6 @@ def test_requester_worker_init_preserves_disk_budget_without_offload_ownership(
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
     _patch_worker_runtime(monkeypatch)
-    monkeypatch.setattr(
-        mooncake_store_worker,
-        "_resolve_preferred_segment",
-        lambda *args, **kwargs: (None, None),
-    )
     monkeypatch.setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "4mb")
     monkeypatch.setenv(
         "MOONCAKE_CONFIG_PATH",
@@ -731,8 +712,17 @@ def test_requester_worker_init_preserves_disk_budget_without_offload_ownership(
             },
         ),
     )
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_get_current_cuda_pci_bus_id",
+        lambda: "00000000:89:00.0",
+    )
 
-    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+    worker = mooncake_store_worker.MooncakeStoreWorker(
+        _make_vllm_config(
+            extra_config={"gpu_bdf_rnic_map": {"00000000:89:00.0": "rocep139s0"}}
+        )
+    )
 
     assert worker.disk_offload_buffer_budget_bytes == 4 * 1024 * 1024
 
@@ -745,11 +735,6 @@ def test_requester_worker_init_builds_replicate_config_for_preferred_segment(
     store.setup.return_value = 0
     fake_replicate_config_cls = _install_fake_mooncake(monkeypatch, store)
     _patch_worker_runtime(monkeypatch)
-    monkeypatch.setattr(
-        mooncake_store_worker,
-        "_resolve_preferred_segment",
-        lambda *args, **kwargs: ("10.0.0.7:50053", None),
-    )
     monkeypatch.setenv(
         "MOONCAKE_CONFIG_PATH",
         _write_mooncake_config(
@@ -762,8 +747,20 @@ def test_requester_worker_init_builds_replicate_config_for_preferred_segment(
             },
         ),
     )
+    monkeypatch.setattr(
+        mooncake_store_worker,
+        "_get_current_cuda_pci_bus_id",
+        lambda: "00000000:89:00.0",
+    )
 
-    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+    worker = mooncake_store_worker.MooncakeStoreWorker(
+        _make_vllm_config(
+            extra_config={
+                "preferred_segment": "10.0.0.7:50053",
+                "gpu_bdf_rnic_map": {"00000000:89:00.0": "rocep139s0"},
+            }
+        )
+    )
 
     assert isinstance(worker.store_replicate_config, fake_replicate_config_cls)
     assert worker.store_replicate_config.preferred_segment == "10.0.0.7:50053"

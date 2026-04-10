@@ -646,6 +646,7 @@ class MooncakeConnectorWorker:
         logger.info("Initializing Mooncake Transfer Engine worker %s", engine_id)
 
         self.vllm_config = vllm_config
+        self.device_id: int = current_platform.current_device()
 
         self.engine = TransferEngine()
         self.hostname = get_ip()
@@ -684,7 +685,6 @@ class MooncakeConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.device_id: int = 0
         self.num_blocks = 0
         self.block_len_per_layer: list[int] = []
         self.seen_base_addresses: list[int] = []
@@ -1260,7 +1260,6 @@ class MooncakeConnectorWorker:
 
                 kernel_block_size = cache.shape[-2 if self.use_mla else -3]
                 assert self.block_size == kernel_block_size
-                self.device_id = max(cache.get_device(), 0)
                 kv_data_ptrs.append(base_addr)
                 kv_data_lens.append(curr_tensor_size_bytes)
 

@@ -41,6 +41,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
@@ -683,6 +684,7 @@ class MooncakeConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.device_id: int = 0
         self.num_blocks = 0
         self.block_len_per_layer: list[int] = []
         self.seen_base_addresses: list[int] = []
@@ -1200,6 +1202,7 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> int:
+        current_platform.set_device(self.device_id)
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
@@ -1257,6 +1260,7 @@ class MooncakeConnectorWorker:
 
                 kernel_block_size = cache.shape[-2 if self.use_mla else -3]
                 assert self.block_size == kernel_block_size
+                self.device_id = max(cache.get_device(), 0)
                 kv_data_ptrs.append(base_addr)
                 kv_data_lens.append(curr_tensor_size_bytes)
 

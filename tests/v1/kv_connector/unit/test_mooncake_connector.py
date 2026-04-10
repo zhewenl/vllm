@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     KVConnectorRole,
     MooncakeConnector,
     MooncakeConnectorMetadata,
+    MooncakeConnectorWorker,
     MooncakeXferMetadata,
     MooncakeXferResponse,
     MooncakeXferResponseStatus,
@@ -558,6 +559,26 @@ async def test_worker_get_finished_timeout(monkeypatch):
         assert "p-req-active" not in finished_reqs
         assert "tx-expired" not in prefill_worker.reqs_need_send
         assert "tx-active" in prefill_worker.reqs_need_send
+
+
+def test_send_blocks_binds_cuda_device_before_transfer():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.device_id = 3
+    worker.shutdown = MagicMock()
+    worker.engine = MagicMock()
+    worker.engine.batch_transfer_sync_write.return_value = 0
+
+    with patch("vllm.platforms.current_platform.set_device") as mock_set_device:
+        ret = worker._send_blocks("decode-host:1234", [0x10], [0x20], [4096])
+
+    assert ret == 0
+    mock_set_device.assert_called_once_with(3)
+    worker.engine.batch_transfer_sync_write.assert_called_once_with(
+        "decode-host:1234",
+        [0x10],
+        [0x20],
+        [4096],
+    )
 
 
 def test_register_kv_caches():

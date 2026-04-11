@@ -14,6 +14,7 @@ import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
     mooncake_store_worker,
+    rdma_utils,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (
     ChunkedTokenDatabase,
@@ -205,15 +206,12 @@ def test_get_requester_local_buffer_size_uses_requester_default():
 def test_get_requester_local_hostname_prefers_override(monkeypatch):
     monkeypatch.setenv("MOONCAKE_LOCAL_HOSTNAME", "worker-a:50053")
 
-    assert (
-        mooncake_store_worker._get_requester_local_hostname("10.0.0.7")
-        == "worker-a:50053"
-    )
+    assert rdma_utils.get_requester_local_hostname("10.0.0.7") == "worker-a:50053"
 
 
 def test_get_configured_preferred_segment_returns_explicit_override():
     assert (
-        mooncake_store_worker._get_configured_preferred_segment(
+        rdma_utils.get_configured_preferred_segment(
             {"preferred_segment": "10.0.0.7:50053"}
         )
         == "10.0.0.7:50053"
@@ -222,17 +220,10 @@ def test_get_configured_preferred_segment_returns_explicit_override():
 
 def test_get_configured_preferred_segment_rejects_empty_override():
     with pytest.raises(ValueError, match="preferred_segment"):
-        mooncake_store_worker._get_configured_preferred_segment(
-            {"preferred_segment": "  "}
-        )
+        rdma_utils.get_configured_preferred_segment({"preferred_segment": "  "})
 
 
 def test_get_configured_worker_rnic_prefers_explicit_device_name(monkeypatch):
-    monkeypatch.setattr(
-        mooncake_store_worker,
-        "_get_current_cuda_pci_bus_id",
-        lambda: "00000000:89:00.0",
-    )
     store_config = mooncake_store_worker.MooncakeStoreConfig(
         metadata_server="",
         requester_local_buffer_size=1,
@@ -242,56 +233,38 @@ def test_get_configured_worker_rnic_prefers_explicit_device_name(monkeypatch):
     )
 
     assert (
-        mooncake_store_worker._get_configured_worker_rnic(store_config, {})
+        rdma_utils.get_configured_worker_rnic(
+            protocol=store_config.protocol,
+            configured_device=store_config.device_name,
+        )
         == "rocep139s0"
     )
 
 
-def test_get_configured_worker_rnic_requires_map_for_rdma(monkeypatch):
+def test_get_configured_worker_rnic_selects_device_from_explicit_csv(monkeypatch):
     monkeypatch.setattr(
-        mooncake_store_worker,
-        "_get_current_cuda_pci_bus_id",
-        lambda: "00000000:89:00.0",
+        rdma_utils,
+        "get_current_physical_gpu_index",
+        lambda: 1,
     )
     store_config = mooncake_store_worker.MooncakeStoreConfig(
         metadata_server="",
         requester_local_buffer_size=1,
         protocol="rdma",
-        device_name="",
+        device_name="rocep139s0,rocep140s0",
         master_server_address="",
     )
 
-    with pytest.raises(ValueError, match="gpu_bdf_rnic_map"):
-        mooncake_store_worker._get_configured_worker_rnic(store_config, {})
-
-
-def test_get_configured_worker_rnic_rejects_non_full_bdf_keys(monkeypatch):
-    monkeypatch.setattr(
-        mooncake_store_worker,
-        "_get_current_cuda_pci_bus_id",
-        lambda: "00000000:89:00.0",
-    )
-    store_config = mooncake_store_worker.MooncakeStoreConfig(
-        metadata_server="",
-        requester_local_buffer_size=1,
-        protocol="rdma",
-        device_name="",
-        master_server_address="",
-    )
-
-    with pytest.raises(ValueError, match="full GPU PCI BDFs"):
-        mooncake_store_worker._get_configured_worker_rnic(
-            store_config,
-            {"gpu_bdf_rnic_map": {"89:00.0": "rocep139s0"}},
+    assert (
+        rdma_utils.get_configured_worker_rnic(
+            protocol=store_config.protocol,
+            configured_device=store_config.device_name,
         )
-
-
-def test_get_configured_worker_rnic_uses_matching_local_gpu_bdf(monkeypatch):
-    monkeypatch.setattr(
-        mooncake_store_worker,
-        "_get_current_cuda_pci_bus_id",
-        lambda: "00000000:c2:00.0",
+        == "rocep140s0"
     )
+
+
+def test_get_configured_worker_rnic_falls_back_to_mooncake():
     store_config = mooncake_store_worker.MooncakeStoreConfig(
         metadata_server="",
         requester_local_buffer_size=1,
@@ -301,37 +274,24 @@ def test_get_configured_worker_rnic_uses_matching_local_gpu_bdf(monkeypatch):
     )
 
     assert (
-        mooncake_store_worker._get_configured_worker_rnic(
-            store_config,
-            {
-                "gpu_bdf_rnic_map": {
-                    "00000000:89:00.0": "rocep139s0",
-                    "00000000:c2:00.0": "rocep196s0",
-                }
-            },
+        rdma_utils.get_configured_worker_rnic(
+            protocol=store_config.protocol,
+            configured_device=store_config.device_name,
         )
-        == "rocep196s0"
+        == ""
     )
 
 
-def test_get_configured_worker_rnic_rejects_missing_local_gpu_entry(monkeypatch):
+def test_get_configured_worker_rnic_rejects_short_explicit_csv(monkeypatch):
     monkeypatch.setattr(
-        mooncake_store_worker,
-        "_get_current_cuda_pci_bus_id",
-        lambda: "00000000:c2:00.0",
+        rdma_utils,
+        "get_current_physical_gpu_index",
+        lambda: 2,
     )
-    store_config = mooncake_store_worker.MooncakeStoreConfig(
-        metadata_server="",
-        requester_local_buffer_size=1,
-        protocol="rdma",
-        device_name="",
-        master_server_address="",
-    )
-
-    with pytest.raises(ValueError, match="does not contain the local GPU PCI BDF"):
-        mooncake_store_worker._get_configured_worker_rnic(
-            store_config,
-            {"gpu_bdf_rnic_map": {"00000000:89:00.0": "rocep139s0"}},
+    with pytest.raises(ValueError, match="does not cover local GPU 2"):
+        rdma_utils.get_configured_worker_rnic(
+            protocol="rdma",
+            configured_device="rocep139s0,rocep140s0",
         )
 
 
@@ -629,17 +589,7 @@ def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
             },
         ),
     )
-    monkeypatch.setattr(
-        mooncake_store_worker,
-        "_get_current_cuda_pci_bus_id",
-        lambda: "00000000:89:00.0",
-    )
-
-    worker = mooncake_store_worker.MooncakeStoreWorker(
-        _make_vllm_config(
-            extra_config={"gpu_bdf_rnic_map": {"00000000:89:00.0": "rocep139s0"}}
-        )
-    )
+    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
 
     assert not hasattr(worker, "_isolate_offload_resources")
     assert store.setup.call_args.args == (
@@ -675,17 +625,7 @@ def test_requester_worker_init_prefers_local_hostname_override(
             },
         ),
     )
-    monkeypatch.setattr(
-        mooncake_store_worker,
-        "_get_current_cuda_pci_bus_id",
-        lambda: "00000000:89:00.0",
-    )
-
-    mooncake_store_worker.MooncakeStoreWorker(
-        _make_vllm_config(
-            extra_config={"gpu_bdf_rnic_map": {"00000000:89:00.0": "rocep139s0"}}
-        )
-    )
+    mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
 
     assert store.setup.call_args.args[0] == "worker-a:50053"
 
@@ -712,17 +652,7 @@ def test_requester_worker_init_preserves_disk_budget_without_offload_ownership(
             },
         ),
     )
-    monkeypatch.setattr(
-        mooncake_store_worker,
-        "_get_current_cuda_pci_bus_id",
-        lambda: "00000000:89:00.0",
-    )
-
-    worker = mooncake_store_worker.MooncakeStoreWorker(
-        _make_vllm_config(
-            extra_config={"gpu_bdf_rnic_map": {"00000000:89:00.0": "rocep139s0"}}
-        )
-    )
+    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
 
     assert worker.disk_offload_buffer_budget_bytes == 4 * 1024 * 1024
 
@@ -747,17 +677,10 @@ def test_requester_worker_init_builds_replicate_config_for_preferred_segment(
             },
         ),
     )
-    monkeypatch.setattr(
-        mooncake_store_worker,
-        "_get_current_cuda_pci_bus_id",
-        lambda: "00000000:89:00.0",
-    )
-
     worker = mooncake_store_worker.MooncakeStoreWorker(
         _make_vllm_config(
             extra_config={
                 "preferred_segment": "10.0.0.7:50053",
-                "gpu_bdf_rnic_map": {"00000000:89:00.0": "rocep139s0"},
             }
         )
     )

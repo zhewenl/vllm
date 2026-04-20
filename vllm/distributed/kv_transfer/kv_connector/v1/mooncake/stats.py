@@ -30,24 +30,36 @@ class MooncakeKVConnectorStats(KVConnectorStats):
             "num_descriptors": [],
             "num_failed_transfers": [],
             "num_failed_recvs": [],
-            "num_expired_reqs": [],
+            "num_kv_expired_reqs": [],
         }
 
     def record_transfer(self, duration_s: float, total_bytes: int, num_descs: int):
-        self.data["transfer_duration"].append(duration_s)
-        self.data["bytes_transferred"].append(total_bytes)
-        self.data["num_descriptors"].append(num_descs)
+        # Bind `data` once so all three appends land in the same dict even if
+        # `clone_and_reset` rebinds `self.data` mid-call. `_send_blocks` runs
+        # on the sender executor pool thread while the reader runs on the main
+        # worker thread — without this capture the three appends can split
+        # across pre-reset and post-reset dicts and break reduce()'s
+        # len(descs) == num_successful_transfers invariant.
+        data = self.data
+        data["transfer_duration"].append(duration_s)
+        data["bytes_transferred"].append(total_bytes)
+        data["num_descriptors"].append(num_descs)
 
+    # Failure counters store a list of 1s so a future Prom counter can iterate
+    # with .inc(list_item), mirroring NIXL's NixlPromMetrics.observe.
     def record_failed_transfer(self):
         self.data["num_failed_transfers"].append(1)
 
     def record_failed_recv(self):
         self.data["num_failed_recvs"].append(1)
 
-    def record_expired_req(self):
-        self.data["num_expired_reqs"].append(1)
+    def record_kv_expired_req(self):
+        self.data["num_kv_expired_reqs"].append(1)
 
     def clone_and_reset(self) -> "MooncakeKVConnectorStats":
+        # Callers must be single-threaded (main worker thread via
+        # get_kv_connector_stats). Writers (record_*) may run concurrently;
+        # record_transfer compensates by capturing `self.data` locally.
         old = copy.copy(self)
         self.reset()
         return old
@@ -57,7 +69,7 @@ class MooncakeKVConnectorStats(KVConnectorStats):
             self.num_successful_transfers == 0
             and len(self.data["num_failed_transfers"]) == 0
             and len(self.data["num_failed_recvs"]) == 0
-            and len(self.data["num_expired_reqs"]) == 0
+            and len(self.data["num_kv_expired_reqs"]) == 0
         )
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
@@ -71,7 +83,7 @@ class MooncakeKVConnectorStats(KVConnectorStats):
     def reduce(self) -> dict[str, int | float]:
         num_failed_transfers = len(self.data["num_failed_transfers"])
         num_failed_recvs = len(self.data["num_failed_recvs"])
-        num_expired_reqs = len(self.data["num_expired_reqs"])
+        num_kv_expired_reqs = len(self.data["num_kv_expired_reqs"])
 
         if self.num_successful_transfers == 0:
             return {
@@ -83,7 +95,7 @@ class MooncakeKVConnectorStats(KVConnectorStats):
                 "Avg number of descriptors": 0,
                 "Num failed transfers": num_failed_transfers,
                 "Num failed recvs": num_failed_recvs,
-                "Num expired reqs": num_expired_reqs,
+                "Num KV expired reqs": num_kv_expired_reqs,
             }
 
         xfer_time = np.asarray(self.data["transfer_duration"])
@@ -108,7 +120,7 @@ class MooncakeKVConnectorStats(KVConnectorStats):
             "Avg number of descriptors": round(descs.mean(), 1),
             "Num failed transfers": num_failed_transfers,
             "Num failed recvs": num_failed_recvs,
-            "Num expired reqs": num_expired_reqs,
+            "Num KV expired reqs": num_kv_expired_reqs,
         }
 
     @property

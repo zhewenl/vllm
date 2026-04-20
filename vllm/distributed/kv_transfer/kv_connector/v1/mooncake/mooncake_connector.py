@@ -446,6 +446,14 @@ class MooncakeConnector(KVConnectorBase_V1):
         pass
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        """Return worker-local transfer stats since the last call.
+
+        Note the P/D asymmetry: because Mooncake is P-push (P calls
+        batch_transfer_sync_write), P records successful transfer latency,
+        bytes, and descriptor counts, while D only records failures
+        (recv/ZMQ errors). Aggregated NIXL-style dashboards will find
+        successful-transfer metrics on the P worker, not D.
+        """
         if self.connector_worker is None:
             return None
         return self.connector_worker.get_kv_connector_stats()
@@ -454,11 +462,7 @@ class MooncakeConnector(KVConnectorBase_V1):
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None
     ) -> KVConnectorStats | None:
-        return (
-            MooncakeKVConnectorStats(data=data)
-            if data is not None
-            else MooncakeKVConnectorStats()
-        )
+        return MooncakeKVConnectorStats(data=data or {})
 
 
 class MooncakeConnectorScheduler:
@@ -1375,7 +1379,7 @@ class MooncakeConnectorWorker:
                     send_meta.p_req_id,
                     envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
                 )
-                self.xfer_stats.record_expired_req()
+                self.xfer_stats.record_kv_expired_req()
                 finished_sending_reqs.add(send_meta.p_req_id)
                 expired_transfer_id.append(transfer_id)
 

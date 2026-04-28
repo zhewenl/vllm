@@ -355,6 +355,25 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self.request_queue.task_done()
             return
 
+        # HMA: assert per-group block_ids matches the registered group count.
+        num_groups = len(self.token_database.groups) or 1
+        if isinstance(block_ids, list) and block_ids and isinstance(block_ids[0], list):
+            req_groups = len(block_ids)
+        else:
+            # Legacy flat list — treat as single group.
+            req_groups = 1
+        if req_groups != num_groups:
+            logger.error(
+                "req %s: KV group count mismatch on save: got %d, expected %d. "
+                "Dropping save.",
+                req_id,
+                req_groups,
+                num_groups,
+            )
+            self.dec_stored_request(req_id)
+            self.request_queue.task_done()
+            return
+
         starts = []
         ends = []
         keys = []
@@ -362,6 +381,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
         for index, (start, end, key) in enumerate(
             self.token_database.process_tokens(token_len, req_meta.block_hashes)
         ):
+            # Skip chunks outside any group's SWA window.
+            if not self.token_database.is_chunk_savable(start, block_ids):
+                continue
             starts.append(start)
             ends.append(end)
             keys.append(key.to_string())
@@ -515,14 +537,33 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             * self.block_size
         )
 
+        # HMA: assert per-group block_ids matches the registered group count.
+        num_groups = len(self.token_database.groups) or 1
+        block_ids = req_meta.block_ids
+        if isinstance(block_ids, list) and block_ids and isinstance(block_ids[0], list):
+            req_groups = len(block_ids)
+        else:
+            req_groups = 1
+        if req_groups != num_groups:
+            logger.error(
+                "req %s: KV group count mismatch on load: got %d, expected %d. "
+                "Dropping load.",
+                req_id,
+                req_groups,
+                num_groups,
+            )
+            return
+
         addr_list = []
         size_list = []
         key_list = []
         for start, end, key in self.token_database.process_tokens(
             token_len, req_meta.block_hashes, mask_num
         ):
+            if not self.token_database.is_chunk_savable(start, block_ids):
+                continue
             addr, size, _ = self.token_database.prepare_value(
-                start, end, req_meta.block_ids
+                start, end, block_ids,
             )
             key_list.append(key.to_string())
             addr_list.append(addr)

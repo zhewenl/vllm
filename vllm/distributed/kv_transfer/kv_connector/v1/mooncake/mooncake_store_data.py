@@ -59,42 +59,132 @@ class PoolKey:
         )
 
 
+@dataclass
+class GroupLayout:
+    """Per-KV-cache-group memory layout.
+
+    base_addrs and block_lens are flattened across the group's layers and
+    K/V segments; entry i is one (layer, K|V) pair.
+    """
+
+    base_addrs: list[int]
+    block_lens: list[int]
+
+
 class ChunkedTokenDatabase:
     """Maps token positions to store keys and GPU memory addresses."""
 
     def __init__(self, metadata: KeyMetadata, block_size: int):
         self.metadata = metadata
         self.block_size = block_size
+        # Legacy flat fields, kept for backwards-compatible callers (set via
+        # set_kv_caches_base_addr / set_block_len). Populated automatically
+        # by set_groups for new callers.
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
+        # New per-group fields. layer_to_group has the same length as
+        # kv_caches_base_addr / block_len; entry i tells which group the
+        # registered segment i belongs to.
+        self.groups: list[GroupLayout] = []
+        self.layer_to_group: list[int] = []
 
     def _make_key_by_hash(self, chunk_hash: str) -> PoolKey:
         return PoolKey(self.metadata, chunk_hash)
 
     def set_kv_caches_base_addr(self, kv_caches_base_addr: list[int]):
+        """Legacy setter — single-group flat layout."""
         self.kv_caches_base_addr = kv_caches_base_addr
+        if not self.groups or len(self.groups) != 1:
+            self.groups = [
+                GroupLayout(base_addrs=kv_caches_base_addr, block_lens=self.block_len)
+            ]
+            self.layer_to_group = [0] * len(kv_caches_base_addr)
 
     def set_block_len(self, block_len: list[int]):
+        """Legacy setter — single-group flat layout."""
         self.block_len = block_len
+        if self.groups and len(self.groups) == 1:
+            self.groups[0].block_lens = block_len
+            self.layer_to_group = [0] * len(self.kv_caches_base_addr)
+
+    def set_groups(
+        self,
+        groups: list[GroupLayout],
+        layer_to_group: list[int],
+    ) -> None:
+        """Group-aware setter — flattens groups into kv_caches_base_addr/block_len."""
+        self.groups = groups
+        self.layer_to_group = layer_to_group
+        flat_addrs: list[int] = []
+        flat_lens: list[int] = []
+        for layout in groups:
+            flat_addrs.extend(layout.base_addrs)
+            flat_lens.extend(layout.block_lens)
+        self.kv_caches_base_addr = flat_addrs
+        self.block_len = flat_lens
 
     def prepare_value(
-        self, start: int, end: int, block_ids: list[int]
+        self,
+        start: int,
+        end: int,
+        block_ids: list[list[int]] | list[int],
     ) -> tuple[list[int], list[int], int]:
         """Compute memory addresses and sizes for a token range.
 
-        Returns:
-            (addr_list, size_list, block_id)
+        block_ids is per-group (list[list[int]]). For single-group callers
+        passing list[int], we wrap it.
         """
-        addr_list = []
-        size_list = []
-        block_id = block_ids[start // self.block_size]
-        length = len(self.block_len)
-        for index, base_addr in enumerate(self.kv_caches_base_addr):
-            addr = base_addr + block_id * self.block_len[index % length]
-            size = int(self.block_len[index % length] / self.block_size * (end - start))
+        if block_ids and not isinstance(block_ids[0], list):
+            block_ids = [block_ids]  # type: ignore[list-item]
+
+        chunk_id = start // self.block_size
+        # FA group is the longest; offset trims older chunks for SWA groups.
+        total_chunks = max(len(g) for g in block_ids) if block_ids else 0
+        per_group_local: list[int] = []
+        for group in block_ids:
+            offset = total_chunks - len(group)
+            local_i = chunk_id - offset
+            per_group_local.append(local_i if 0 <= local_i < len(group) else -1)
+
+        addr_list: list[int] = []
+        size_list: list[int] = []
+        last_block_id = 0
+        for seg_idx, base_addr in enumerate(self.kv_caches_base_addr):
+            g = self.layer_to_group[seg_idx] if self.layer_to_group else 0
+            local_i = per_group_local[g]
+            if local_i < 0:
+                # Defensive: caller (worker) should have filtered via
+                # is_chunk_savable. Emit zeros so list shape is preserved.
+                addr_list.append(0)
+                size_list.append(0)
+                continue
+            block_id = block_ids[g][local_i]
+            block_len = self.block_len[seg_idx]
+            addr = base_addr + block_id * block_len
+            size = int(block_len / self.block_size * (end - start))
             addr_list.append(addr)
             size_list.append(size)
-        return addr_list, size_list, block_id
+            last_block_id = block_id
+        return addr_list, size_list, last_block_id
+
+    def is_chunk_savable(
+        self,
+        start: int,
+        block_ids: list[list[int]] | list[int],
+    ) -> bool:
+        """A chunk is savable iff it is in window for every group."""
+        if block_ids and not isinstance(block_ids[0], list):
+            block_ids = [block_ids]  # type: ignore[list-item]
+        if not block_ids:
+            return False
+        chunk_id = start // self.block_size
+        total_chunks = max(len(g) for g in block_ids)
+        for group in block_ids:
+            offset = total_chunks - len(group)
+            local_i = chunk_id - offset
+            if not (0 <= local_i < len(group)):
+                return False
+        return True
 
     def process_tokens(
         self,

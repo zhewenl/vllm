@@ -128,3 +128,87 @@ def test_scheduler_request_finished_clips_swa_group():
 
     delay, _ = scheduler.request_finished(request, (fa_blocks, sw_blocks))
     assert delay is True
+
+
+# ---------------------------------------------------------------------------
+# Task 3: ChunkedTokenDatabase group-aware prepare_value
+# ---------------------------------------------------------------------------
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (  # noqa: E402,E501
+    ChunkedTokenDatabase,
+    GroupLayout,
+    KeyMetadata,
+)
+
+
+@pytest.mark.cpu_test
+def test_prepare_value_picks_right_group_block_ids():
+    """A layer in the SWA group must address through SWA's clipped block ids."""
+    block_size = 16
+    metadata = KeyMetadata(
+        model_name="m", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0,
+    )
+    db = ChunkedTokenDatabase(metadata, block_size=block_size)
+
+    fa_layout = GroupLayout(base_addrs=[0x1000], block_lens=[256])
+    sw_layout = GroupLayout(base_addrs=[0x2000], block_lens=[256])
+    db.set_groups([fa_layout, sw_layout], layer_to_group=[0, 1])
+
+    # 20 chunks total. SWA holds last 9.
+    fa_block_ids = list(range(20))
+    sw_block_ids = list(range(100, 109))
+    block_ids_per_group = [fa_block_ids, sw_block_ids]
+
+    # Chunk 19 (last): SWA local index = 19 - (20 - 9) = 8 → 108.
+    addr_list, size_list, _ = db.prepare_value(
+        start=19 * block_size, end=20 * block_size,
+        block_ids=block_ids_per_group,
+    )
+    assert len(addr_list) == 2
+    assert addr_list[0] == 0x1000 + 19 * 256        # FA: block 19
+    assert addr_list[1] == 0x2000 + 108 * 256       # SWA: block 108
+
+
+@pytest.mark.cpu_test
+def test_prepare_value_single_group_unchanged():
+    """N=1 (single full-attention group) must produce the same addresses as before."""
+    block_size = 16
+    metadata = KeyMetadata(
+        model_name="m", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0,
+    )
+    db = ChunkedTokenDatabase(metadata, block_size=block_size)
+
+    layout = GroupLayout(base_addrs=[0x1000, 0x2000], block_lens=[256, 256])
+    db.set_groups([layout], layer_to_group=[0, 0])
+
+    block_ids_per_group = [[5, 6, 7, 8]]
+    addr_list, _, _ = db.prepare_value(
+        start=2 * block_size, end=3 * block_size,
+        block_ids=block_ids_per_group,
+    )
+    assert addr_list == [0x1000 + 7 * 256, 0x2000 + 7 * 256]
+
+
+@pytest.mark.cpu_test
+def test_is_chunk_savable_intersection_of_groups():
+    """A chunk is savable iff it lies within every group's window."""
+    block_size = 16
+    metadata = KeyMetadata(
+        model_name="m", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0,
+    )
+    db = ChunkedTokenDatabase(metadata, block_size=block_size)
+    db.set_groups(
+        [
+            GroupLayout(base_addrs=[0x1000], block_lens=[256]),
+            GroupLayout(base_addrs=[0x2000], block_lens=[256]),
+        ],
+        layer_to_group=[0, 1],
+    )
+
+    fa = list(range(20))
+    sw = list(range(100, 109))  # group_start_chunk = 11
+    block_ids = [fa, sw]
+
+    assert db.is_chunk_savable(start=5 * block_size, block_ids=block_ids) is False
+    assert db.is_chunk_savable(start=11 * block_size, block_ids=block_ids) is True
+    assert db.is_chunk_savable(start=19 * block_size, block_ids=block_ids) is True
+    assert db.is_chunk_savable(start=20 * block_size, block_ids=block_ids) is False

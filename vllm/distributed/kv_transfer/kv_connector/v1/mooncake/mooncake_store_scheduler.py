@@ -3,7 +3,7 @@
 """Scheduler-side logic for MooncakeStoreConnector."""
 
 import os
-from typing import Any
+from typing import Any, cast
 
 import zmq
 
@@ -103,7 +103,7 @@ class MooncakeStoreScheduler:
         if len(block_ids) == 0 or not self._is_hma_required:
             return list(block_ids)
         return [
-            blocks[-self.blocks_per_sw[i]:] if self.blocks_per_sw[i] > 0 else blocks
+            blocks[-self.blocks_per_sw[i] :] if self.blocks_per_sw[i] > 0 else blocks
             for i, blocks in enumerate(block_ids)
         ]
 
@@ -119,9 +119,10 @@ class MooncakeStoreScheduler:
             and len(block_ids) > 0
             and isinstance(block_ids[0], list)
         ):
-            return self.get_sw_clipped_blocks(block_ids)
+            return self.get_sw_clipped_blocks(cast(list[list[int]], block_ids))
         # Flat list[int] → wrap as single group, no clipping.
-        return [list(block_ids)] if block_ids else [[]]
+        flat = cast(list[int], block_ids)
+        return [list(flat)] if flat else [[]]
 
     def get_num_new_matched_tokens(
         self,

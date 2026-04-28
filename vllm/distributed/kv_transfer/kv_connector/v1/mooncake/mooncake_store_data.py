@@ -4,7 +4,7 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, cast
 
 import torch
 
@@ -123,6 +123,15 @@ class ChunkedTokenDatabase:
         self.kv_caches_base_addr = flat_addrs
         self.block_len = flat_lens
 
+    @staticmethod
+    def _normalize_per_group(
+        block_ids: list[list[int]] | list[int],
+    ) -> list[list[int]]:
+        """Coerce a flat list[int] to a single-group list[list[int]]."""
+        if block_ids and not isinstance(block_ids[0], list):
+            return [cast(list[int], block_ids)]
+        return cast(list[list[int]], block_ids)
+
     def prepare_value(
         self,
         start: int,
@@ -134,14 +143,13 @@ class ChunkedTokenDatabase:
         block_ids is per-group (list[list[int]]). For single-group callers
         passing list[int], we wrap it.
         """
-        if block_ids and not isinstance(block_ids[0], list):
-            block_ids = [block_ids]  # type: ignore[list-item]
+        per_group = self._normalize_per_group(block_ids)
 
         chunk_id = start // self.block_size
         # FA group is the longest; offset trims older chunks for SWA groups.
-        total_chunks = max(len(g) for g in block_ids) if block_ids else 0
+        total_chunks = max(len(g) for g in per_group) if per_group else 0
         per_group_local: list[int] = []
-        for group in block_ids:
+        for group in per_group:
             offset = total_chunks - len(group)
             local_i = chunk_id - offset
             per_group_local.append(local_i if 0 <= local_i < len(group) else -1)
@@ -158,7 +166,7 @@ class ChunkedTokenDatabase:
                 addr_list.append(0)
                 size_list.append(0)
                 continue
-            block_id = block_ids[g][local_i]
+            block_id = per_group[g][local_i]
             block_len = self.block_len[seg_idx]
             addr = base_addr + block_id * block_len
             size = int(block_len / self.block_size * (end - start))
@@ -173,13 +181,12 @@ class ChunkedTokenDatabase:
         block_ids: list[list[int]] | list[int],
     ) -> bool:
         """A chunk is savable iff it is in window for every group."""
-        if block_ids and not isinstance(block_ids[0], list):
-            block_ids = [block_ids]  # type: ignore[list-item]
-        if not block_ids:
+        per_group = self._normalize_per_group(block_ids)
+        if not per_group:
             return False
         chunk_id = start // self.block_size
-        total_chunks = max(len(g) for g in block_ids)
-        for group in block_ids:
+        total_chunks = max(len(g) for g in per_group)
+        for group in per_group:
             offset = total_chunks - len(group)
             local_i = chunk_id - offset
             if not (0 <= local_i < len(group)):
@@ -251,23 +258,22 @@ class RequestTracker:
         if len(new_block_ids) == 0:
             return
 
-        if isinstance(new_block_ids, tuple) or (
-            isinstance(new_block_ids, list)
-            and len(new_block_ids) > 0
-            and isinstance(new_block_ids[0], list)
-        ):
-            assert len(new_block_ids) == len(self.allocated_block_ids), (
-                f"KV group count mismatch on update: got {len(new_block_ids)} "
-                f"groups, tracker has {len(self.allocated_block_ids)}"
-            )
-            for g, group_blocks in enumerate(new_block_ids):
-                self.allocated_block_ids[g].extend(group_blocks)
+        if isinstance(new_block_ids, tuple):
+            per_group = list(new_block_ids)
+        elif isinstance(new_block_ids, list) and isinstance(new_block_ids[0], list):
+            per_group = cast(list[list[int]], new_block_ids)
         elif isinstance(new_block_ids, list):
-            self.allocated_block_ids[0].extend(new_block_ids)
+            self.allocated_block_ids[0].extend(cast(list[int], new_block_ids))
+            return
         else:
-            raise ValueError(
-                f"Unsupported new_block_ids type {type(new_block_ids)}"
-            )
+            raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
+
+        assert len(per_group) == len(self.allocated_block_ids), (
+            f"KV group count mismatch on update: got {len(per_group)} "
+            f"groups, tracker has {len(self.allocated_block_ids)}"
+        )
+        for g, group_blocks in enumerate(per_group):
+            self.allocated_block_ids[g].extend(group_blocks)
 
 
 @dataclass

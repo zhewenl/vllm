@@ -103,11 +103,13 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = MooncakeStoreScheduler(
-                vllm_config, kv_cache_config=kv_cache_config,
+                vllm_config,
+                kv_cache_config=kv_cache_config,
             )
         else:
             self.connector_worker = MooncakeStoreWorker(
-                vllm_config, kv_cache_config=kv_cache_config,
+                vllm_config,
+                kv_cache_config=kv_cache_config,
             )
             if vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)

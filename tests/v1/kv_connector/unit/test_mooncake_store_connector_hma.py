@@ -24,7 +24,9 @@ def _make_scheduler(
     )
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = disable_hma
     kv_cache_config = make_kv_cache_config(
-        block_size=block_size, swa_enabled=swa_enabled, sw_size=sw_size,
+        block_size=block_size,
+        swa_enabled=swa_enabled,
+        sw_size=sw_size,
     )
     return MooncakeStoreScheduler(vllm_config, kv_cache_config=kv_cache_config)
 
@@ -66,8 +68,8 @@ def test_get_sw_clipped_blocks_clips_swa_keeps_fa():
     sw_blocks = list(range(100, 120))
     clipped = scheduler.get_sw_clipped_blocks((fa_blocks, sw_blocks))
 
-    assert clipped[0] == fa_blocks            # FA untouched
-    assert clipped[1] == sw_blocks[-9:]       # SWA clipped to last 9
+    assert clipped[0] == fa_blocks  # FA untouched
+    assert clipped[1] == sw_blocks[-9:]  # SWA clipped to last 9
     assert len(clipped[1]) == 9
 
 
@@ -93,7 +95,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data i
 def test_request_tracker_update_extends_each_group():
     """update() must extend the matching group, not flatten."""
     tracker = RequestTracker(
-        req_id="r1", token_len=0, allocated_block_ids=[[1, 2], [10, 11]],
+        req_id="r1",
+        token_len=0,
+        allocated_block_ids=[[1, 2], [10, 11]],
     )
     tracker.update(([3, 4], [12, 13]))
     assert tracker.allocated_block_ids == [[1, 2, 3, 4], [10, 11, 12, 13]]
@@ -103,7 +107,9 @@ def test_request_tracker_update_extends_each_group():
 def test_request_tracker_update_accepts_flat_list_as_single_group():
     """Legacy flat list extends group 0 (single-group compat)."""
     tracker = RequestTracker(
-        req_id="r1", token_len=0, allocated_block_ids=[[1, 2]],
+        req_id="r1",
+        token_len=0,
+        allocated_block_ids=[[1, 2]],
     )
     tracker.update([3, 4])
     assert tracker.allocated_block_ids == [[1, 2, 3, 4]]
@@ -145,7 +151,11 @@ def test_prepare_value_picks_right_group_block_ids():
     """A layer in the SWA group must address through SWA's clipped block ids."""
     block_size = 16
     metadata = KeyMetadata(
-        model_name="m", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0,
+        model_name="m",
+        tp_rank=0,
+        pcp_rank=0,
+        dcp_rank=0,
+        pp_rank=0,
     )
     db = ChunkedTokenDatabase(metadata, block_size=block_size)
 
@@ -160,12 +170,13 @@ def test_prepare_value_picks_right_group_block_ids():
 
     # Chunk 19 (last): SWA local index = 19 - (20 - 9) = 8 → 108.
     addr_list, size_list, _ = db.prepare_value(
-        start=19 * block_size, end=20 * block_size,
+        start=19 * block_size,
+        end=20 * block_size,
         block_ids=block_ids_per_group,
     )
     assert len(addr_list) == 2
-    assert addr_list[0] == 0x1000 + 19 * 256        # FA: block 19
-    assert addr_list[1] == 0x2000 + 108 * 256       # SWA: block 108
+    assert addr_list[0] == 0x1000 + 19 * 256  # FA: block 19
+    assert addr_list[1] == 0x2000 + 108 * 256  # SWA: block 108
 
 
 @pytest.mark.cpu_test
@@ -173,7 +184,11 @@ def test_prepare_value_single_group_unchanged():
     """N=1 (single full-attention group) must produce the same addresses as before."""
     block_size = 16
     metadata = KeyMetadata(
-        model_name="m", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0,
+        model_name="m",
+        tp_rank=0,
+        pcp_rank=0,
+        dcp_rank=0,
+        pp_rank=0,
     )
     db = ChunkedTokenDatabase(metadata, block_size=block_size)
 
@@ -182,7 +197,8 @@ def test_prepare_value_single_group_unchanged():
 
     block_ids_per_group = [[5, 6, 7, 8]]
     addr_list, _, _ = db.prepare_value(
-        start=2 * block_size, end=3 * block_size,
+        start=2 * block_size,
+        end=3 * block_size,
         block_ids=block_ids_per_group,
     )
     assert addr_list == [0x1000 + 7 * 256, 0x2000 + 7 * 256]
@@ -193,7 +209,11 @@ def test_is_chunk_savable_intersection_of_groups():
     """A chunk is savable iff it lies within every group's window."""
     block_size = 16
     metadata = KeyMetadata(
-        model_name="m", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0,
+        model_name="m",
+        tp_rank=0,
+        pcp_rank=0,
+        dcp_rank=0,
+        pp_rank=0,
     )
     db = ChunkedTokenDatabase(metadata, block_size=block_size)
     db.set_groups(
@@ -236,7 +256,8 @@ def test_register_kv_caches_buckets_by_kv_cache_group():
         block_size=block_size,
     )
     kv_cache_config = make_kv_cache_config(
-        block_size=block_size, swa_enabled=True,
+        block_size=block_size,
+        swa_enabled=True,
     )
     # FA group claims layer0 + layer2; SWA group claims layer1 + layer3.
 
@@ -254,10 +275,15 @@ def test_register_kv_caches_buckets_by_kv_cache_group():
     worker.put_step = 1
     worker.kv_role = "kv_both"
     worker.metadata = mooncake_store_worker.KeyMetadata(
-        model_name="m", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0,
+        model_name="m",
+        tp_rank=0,
+        pcp_rank=0,
+        dcp_rank=0,
+        pp_rank=0,
     )
     worker.token_database = mooncake_store_worker.ChunkedTokenDatabase(
-        worker.metadata, block_size=block_size,
+        worker.metadata,
+        block_size=block_size,
     )
     worker.store = MagicMock()
     worker.store.register_buffer = MagicMock(return_value=0)
@@ -273,14 +299,16 @@ def test_register_kv_caches_buckets_by_kv_cache_group():
     fa_tensor = torch.zeros((4, 16, 64), dtype=torch.float16)
     sw_tensor = torch.zeros((4, 16, 64), dtype=torch.float16)
     kv_caches = {
-        "layer0": fa_tensor, "layer2": fa_tensor.clone(),
-        "layer1": sw_tensor, "layer3": sw_tensor.clone(),
+        "layer0": fa_tensor,
+        "layer2": fa_tensor.clone(),
+        "layer1": sw_tensor,
+        "layer3": sw_tensor.clone(),
     }
-    with patch.object(
-        mooncake_store_worker, "KVCacheStoreSendingThread"
-    ), patch.object(
-        mooncake_store_worker, "KVCacheStoreRecvingThread"
-    ), patch.object(mooncake_store_worker.threading, "Event") as mock_event:
+    with (
+        patch.object(mooncake_store_worker, "KVCacheStoreSendingThread"),
+        patch.object(mooncake_store_worker, "KVCacheStoreRecvingThread"),
+        patch.object(mooncake_store_worker.threading, "Event") as mock_event,
+    ):
         # Avoid blocking on ready_event_recving.wait().
         mock_event.return_value.wait = MagicMock()
         worker.register_kv_caches(kv_caches)

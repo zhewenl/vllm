@@ -563,7 +563,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             if not self.token_database.is_chunk_savable(start, block_ids):
                 continue
             addr, size, _ = self.token_database.prepare_value(
-                start, end, block_ids,
+                start,
+                end,
+                block_ids,
             )
             key_list.append(key.to_string())
             addr_list.append(addr)

@@ -145,7 +145,7 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
     def request_finished(
         self,
         request: Request,
-        block_ids: list[int],
+        block_ids: tuple[list[int], ...] | list[int] | list[list[int]],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)

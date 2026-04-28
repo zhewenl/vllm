@@ -143,23 +143,41 @@ class RequestTracker:
 
     req_id: str
     token_len: int
-    allocated_block_ids: list[int]
+    # One list of block ids per KV cache group. Single-group models use [[...]]
+    allocated_block_ids: list[list[int]]
     num_saved_tokens: int = 0
     token_ids: list[int] | None = None
 
     def update(
         self,
-        new_block_ids: tuple[list[int], ...] | list[int],
+        new_block_ids: tuple[list[int], ...] | list[list[int]] | list[int],
     ) -> None:
+        """Append new blocks to each group.
+
+        Accepts:
+          - tuple/list of per-group block lists (HMA shape)
+          - flat list[int] for legacy single-group callers
+        """
         if len(new_block_ids) == 0:
-            new_block_ids = []
-        elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
+            return
+
+        if isinstance(new_block_ids, tuple) or (
+            isinstance(new_block_ids, list)
+            and len(new_block_ids) > 0
+            and isinstance(new_block_ids[0], list)
+        ):
+            assert len(new_block_ids) == len(self.allocated_block_ids), (
+                f"KV group count mismatch on update: got {len(new_block_ids)} "
+                f"groups, tracker has {len(self.allocated_block_ids)}"
+            )
+            for g, group_blocks in enumerate(new_block_ids):
+                self.allocated_block_ids[g].extend(group_blocks)
         elif isinstance(new_block_ids, list):
-            pass
+            self.allocated_block_ids[0].extend(new_block_ids)
         else:
-            raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
-        self.allocated_block_ids.extend(new_block_ids)
+            raise ValueError(
+                f"Unsupported new_block_ids type {type(new_block_ids)}"
+            )
 
 
 @dataclass
@@ -168,7 +186,7 @@ class ReqMeta:
 
     req_id: str
     token_len_chunk: int
-    block_ids: list[int]
+    block_ids: list[list[int]]
     block_hashes: list[BlockHash]
 
     can_save: bool | None = None

@@ -77,3 +77,54 @@ def test_get_sw_clipped_blocks_noop_when_not_hma():
     assert scheduler._is_hma_required is False
     block_ids = ([1, 2, 3],)
     assert scheduler.get_sw_clipped_blocks(block_ids) == [[1, 2, 3]]
+
+
+# ---------------------------------------------------------------------------
+# Task 2: per-group block_ids end-to-end
+# ---------------------------------------------------------------------------
+from unittest.mock import MagicMock
+
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (  # noqa: E402,E501
+    RequestTracker,
+)
+
+
+@pytest.mark.cpu_test
+def test_request_tracker_update_extends_each_group():
+    """update() must extend the matching group, not flatten."""
+    tracker = RequestTracker(
+        req_id="r1", token_len=0, allocated_block_ids=[[1, 2], [10, 11]],
+    )
+    tracker.update(([3, 4], [12, 13]))
+    assert tracker.allocated_block_ids == [[1, 2, 3, 4], [10, 11, 12, 13]]
+
+
+@pytest.mark.cpu_test
+def test_request_tracker_update_accepts_flat_list_as_single_group():
+    """Legacy flat list extends group 0 (single-group compat)."""
+    tracker = RequestTracker(
+        req_id="r1", token_len=0, allocated_block_ids=[[1, 2]],
+    )
+    tracker.update([3, 4])
+    assert tracker.allocated_block_ids == [[1, 2, 3, 4]]
+
+
+@pytest.mark.cpu_test
+def test_scheduler_request_finished_clips_swa_group():
+    """request_finished must clip SWA group on the way to delay-free state."""
+    scheduler = _make_scheduler(swa_enabled=True, sw_size=128, block_size=16)
+    fa_blocks = list(range(20))
+    sw_blocks = list(range(100, 120))
+
+    request = MagicMock()
+    request.request_id = "r-finished"
+    request.kv_transfer_params = {}
+    scheduler._request_trackers["r-finished"] = RequestTracker(
+        req_id="r-finished",
+        token_len=20 * 16,
+        allocated_block_ids=[fa_blocks, sw_blocks],
+        num_saved_tokens=20 * 16,
+    )
+
+    delay, _ = scheduler.request_finished(request, (fa_blocks, sw_blocks))
+    assert delay is True

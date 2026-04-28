@@ -102,7 +102,9 @@ class MooncakeStoreConnector(KVConnectorBase_V1):
         self.connector_worker: MooncakeStoreWorker | None = None
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = MooncakeStoreScheduler(vllm_config)
+            self.connector_scheduler = MooncakeStoreScheduler(
+                vllm_config, kv_cache_config=kv_cache_config,
+            )
         else:
             self.connector_worker = MooncakeStoreWorker(vllm_config)
             if vllm_config.parallel_config.rank == 0:

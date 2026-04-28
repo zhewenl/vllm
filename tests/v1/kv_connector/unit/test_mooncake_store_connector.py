@@ -61,7 +61,7 @@ def test_scheduler_role_initializes_store_scheduler_only():
             vllm_config, KVConnectorRole.SCHEDULER
         )
 
-    mock_scheduler.assert_called_once_with(vllm_config)
+    mock_scheduler.assert_called_once_with(vllm_config, kv_cache_config=None)
     mock_worker.assert_not_called()
     mock_lookup_server.assert_not_called()
     assert connector.connector_scheduler is mock_scheduler.return_value

@@ -22,10 +22,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
     get_mooncake_dp_engine_index,
 )
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    SlidingWindowSpec,
+)
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
 
@@ -35,7 +41,11 @@ logger = init_logger(__name__)
 class MooncakeStoreScheduler:
     """Scheduler-side component for MooncakeStoreConnector."""
 
-    def __init__(self, vllm_config: VllmConfig):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig | None = None,
+    ):
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "load_async", False
@@ -59,8 +69,43 @@ class MooncakeStoreScheduler:
                 "discard_partial_chunks", True
             )
         )
-        self._unfinished_requests: dict[str, tuple[Request, list[int]]] = {}
+        self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
         self._unfinished_request_ids: set[str] = set()
+
+        # HMA detection. blocks_per_sw[g] is non-zero only for SlidingWindowSpec
+        # groups; FullAttentionSpec groups stay 0 and are never clipped.
+        self._is_hma_required = False
+        self.blocks_per_sw: list[int] = [0]
+        if kv_cache_config is not None:
+            self._is_hma_required = (
+                not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+                and any(
+                    not isinstance(g.kv_cache_spec, FullAttentionSpec)
+                    for g in kv_cache_config.kv_cache_groups
+                )
+            )
+            sw_sizes_tokens: list[tuple[int, int]] = [
+                (g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size)
+                if isinstance(g.kv_cache_spec, SlidingWindowSpec)
+                else (0, self._block_size)
+                for g in kv_cache_config.kv_cache_groups
+            ]
+            self.blocks_per_sw = [
+                cdiv(n_tokens, block_size) + 1 if n_tokens else 0
+                for n_tokens, block_size in sw_sizes_tokens
+            ]
+
+    def get_sw_clipped_blocks(
+        self,
+        block_ids: tuple[list[int], ...] | list[list[int]],
+    ) -> list[list[int]]:
+        """Clip per-group block IDs to the SWA window. No-op for non-HMA."""
+        if len(block_ids) == 0 or not self._is_hma_required:
+            return list(block_ids)
+        return [
+            blocks[-self.blocks_per_sw[i]:] if self.blocks_per_sw[i] > 0 else blocks
+            for i, blocks in enumerate(block_ids)
+        ]
 
     def get_num_new_matched_tokens(
         self,

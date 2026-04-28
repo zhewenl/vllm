@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 from unittest.mock import MagicMock
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
@@ -80,6 +81,81 @@ def test_aggregate_with_empty_other_is_noop():
     a.aggregate(b)
 
     assert a.num_successful_transfers == 1
+
+
+def test_getstate_drops_lock_and_setstate_recreates_it():
+    # KVConnectorStats subclasses must be picklable (worker→scheduler IPC),
+    # but threading.Lock isn't — so __getstate__ strips it and __setstate__
+    # rebuilds a fresh per-process lock.
+    original = MooncakeKVConnectorStats()
+    original.record_transfer(duration_s=0.01, total_bytes=2048, num_descs=3)
+
+    state = original.__getstate__()
+    assert "_lock" not in state
+
+    rebuilt = MooncakeKVConnectorStats.__new__(MooncakeKVConnectorStats)
+    rebuilt.__setstate__(state)
+    assert rebuilt.data == original.data
+    # Lock works on the receiver side.
+    rebuilt.record_transfer(duration_s=0.02, total_bytes=4096, num_descs=5)
+    assert rebuilt.num_successful_transfers == 2
+
+
+def test_concurrent_writers_keep_row_lengths_aligned():
+    # Multiple writers + a snapshot reader must never produce a snapshot
+    # with mismatched column lengths — reduce()'s
+    # len(descs) == num_successful_transfers assertion would fire.
+    stats = MooncakeKVConnectorStats()
+    stop = threading.Event()
+    writer_count = 4
+    snapshots: list[MooncakeKVConnectorStats] = []
+
+    def writer():
+        i = 0
+        while not stop.is_set():
+            stats.record_transfer(
+                duration_s=0.001 + i * 1e-9,
+                total_bytes=1024 + i,
+                num_descs=1 + (i % 8),
+            )
+            i += 1
+
+    def snapper():
+        while not stop.is_set():
+            snap = stats.clone_and_reset()
+            if not snap.is_empty():
+                # Force the same path the logger walks; reduce() will
+                # blow up on torn rows via its internal assert.
+                snap.reduce()
+                snapshots.append(snap)
+
+    threads = [threading.Thread(target=writer) for _ in range(writer_count)]
+    snapshotter = threading.Thread(target=snapper)
+    for t in threads:
+        t.start()
+    snapshotter.start()
+    # Short fixed window — long enough to interleave thousands of ops.
+    threading.Event().wait(0.2)
+    stop.set()
+    for t in threads:
+        t.join()
+    snapshotter.join()
+
+    # Final drain so we don't lose the in-flight tail.
+    final = stats.clone_and_reset()
+    if not final.is_empty():
+        final.reduce()
+        snapshots.append(final)
+
+    # Every snapshot's columns must have identical lengths (the invariant
+    # the lock protects), and the union must contain at least one row.
+    total_rows = 0
+    for snap in snapshots:
+        n = len(snap.data["transfer_duration"])
+        assert len(snap.data["bytes_transferred"]) == n
+        assert len(snap.data["num_descriptors"]) == n
+        total_rows += n
+    assert total_rows > 0
 
 
 def test_clone_and_reset_hands_off_old_data():

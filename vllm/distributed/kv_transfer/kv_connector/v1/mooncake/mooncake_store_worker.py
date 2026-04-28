@@ -28,6 +28,7 @@ from vllm.distributed import (
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_store_data import (
     ChunkedTokenDatabase,
+    GroupLayout,
     KeyMetadata,
     MooncakeStoreConnectorMetadata,
     ReqMeta,
@@ -41,6 +42,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.serial_utils import MsgpackDecoder
 
 logger = init_logger(__name__)
@@ -617,7 +619,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 class MooncakeStoreWorker:
     """Worker-side component for MooncakeStoreConnector."""
 
-    def __init__(self, vllm_config: VllmConfig):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: "KVCacheConfig | None" = None,
+    ):
         try:
             from mooncake.store import MooncakeDistributedStore  # type: ignore
         except ImportError as e:
@@ -627,6 +633,7 @@ class MooncakeStoreWorker:
                 "en/build.md to run vLLM with MooncakeStoreConnector."
             ) from e
 
+        self.kv_cache_config = kv_cache_config
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
@@ -728,8 +735,12 @@ class MooncakeStoreWorker:
         self.register_kv_caches({"__cross_layer__": kv_cache})
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        """Register KV cache tensors and start transfer threads."""
-        # TODO(yifan): we haven't supported HMA yet.
+        """Register KV cache tensors and start transfer threads.
+
+        Buckets layers by kv_cache_config.kv_cache_groups so HMA models
+        (mixed FullAttention + SlidingWindow) get one GroupLayout per
+        group and prepare_value can resolve per-group block ids.
+        """
         first_kv_cache = next(iter(kv_caches.values()))
 
         # num_blocks from cache_config is authoritative (set after
@@ -738,18 +749,12 @@ class MooncakeStoreWorker:
         self.num_blocks = self.cache_config.num_gpu_blocks
 
         # Detect the KV cache memory layout using the stride-based
-        # approach from simple_kv_offload/worker.py.
+        # approach from simple_kv_offload/worker.py. Same logic as
+        # before, but now applied per group.
         #
         # The physical layout varies across attention backends:
         #   FlashAttn/ROCm : (2, num_blocks, ...) → K/V outermost
         #   FlashInfer/MLA : (num_blocks, ...)    → blocks outermost
-        #
-        # We derive page_size_bytes = storage.nbytes() // num_blocks,
-        # then classify dims: any dim whose byte-stride exceeds
-        # page_size_bytes must be an outer segment dim (e.g. the K/V
-        # dim of size 2).  For those backends we register each segment
-        # (K, V) as a separate base-address so that the per-block
-        # offset arithmetic in prepare_value() stays correct.
         storage = first_kv_cache.untyped_storage()
         el = first_kv_cache.element_size()
         page_size_bytes = storage.nbytes() // self.num_blocks
@@ -759,54 +764,90 @@ class MooncakeStoreWorker:
             if first_kv_cache.stride(d) * el > page_size_bytes
         ]
 
-        # Register buffers with the store (deduplicate shared storages)
-        # and record per-segment base addresses for every layer.
+        # Bucket layers by KV cache group. If kv_cache_config is missing
+        # (legacy / tests / no-arg construction), fall back to a single
+        # group containing everything — preserves N=1 behavior for
+        # DeepSeek/MLA.
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        if kv_cache_config is not None:
+            layer_to_group_idx: dict[str, int] = {}
+            for g_idx, group in enumerate(kv_cache_config.kv_cache_groups):
+                for layer_name in group.layer_names:
+                    layer_to_group_idx[layer_name] = g_idx
+            num_groups = len(kv_cache_config.kv_cache_groups)
+        else:
+            layer_to_group_idx = {name: 0 for name in kv_caches}
+            num_groups = 1
+
+        # Group caches by their KV cache group, preserving registration order.
+        grouped_caches: list[list[tuple[str, torch.Tensor]]] = [
+            [] for _ in range(num_groups)
+        ]
+        for name, cache in kv_caches.items():
+            g_idx = layer_to_group_idx.get(name, 0)
+            grouped_caches[g_idx].append((name, cache))
+
         seen_ptrs: set[int] = set()
-        self.kv_caches_base_addr: list[int] = []
-        self.block_len: list[int] = []
+        groups: list[GroupLayout] = []
+        flat_layer_to_group: list[int] = []
 
-        for cache in kv_caches.values():
-            cache_storage = cache.untyped_storage()
-            base_addr = cache_storage.data_ptr()
-            region_len = cache_storage.nbytes()
+        for g_idx, layers in enumerate(grouped_caches):
+            group_base_addrs: list[int] = []
+            group_block_lens: list[int] = []
+            for _, cache in layers:
+                cache_storage = cache.untyped_storage()
+                base_addr = cache_storage.data_ptr()
+                region_len = cache_storage.nbytes()
 
-            if base_addr not in seen_ptrs:
-                seen_ptrs.add(base_addr)
-                ret = self.store.register_buffer(base_addr, region_len)
-                if ret != 0:
-                    logger.error(
-                        "register_buffer failed for addr %#x len %d: %d",
-                        base_addr,
-                        region_len,
-                        ret,
-                    )
+                if base_addr not in seen_ptrs:
+                    seen_ptrs.add(base_addr)
+                    ret = self.store.register_buffer(base_addr, region_len)
+                    if ret != 0:
+                        logger.error(
+                            "register_buffer failed for addr %#x len %d: %d",
+                            base_addr,
+                            region_len,
+                            ret,
+                        )
 
-            if not outer_dims:
-                # Blocks-first layout (FlashInfer / MLA): one segment.
-                self.kv_caches_base_addr.append(base_addr)
-                self.block_len.append(page_size_bytes)
-            else:
-                # K/V-first layout (FlashAttn / ROCm): split segments.
-                seg_stride = cache.stride(outer_dims[0]) * el
-                for idx in range(cache.shape[outer_dims[0]]):
-                    self.kv_caches_base_addr.append(base_addr + idx * seg_stride)
-                    self.block_len.append(seg_stride // self.num_blocks)
+                if not outer_dims:
+                    # Blocks-first layout (FlashInfer / MLA): one segment.
+                    group_base_addrs.append(base_addr)
+                    group_block_lens.append(page_size_bytes)
+                    flat_layer_to_group.append(g_idx)
+                else:
+                    # K/V-first layout (FlashAttn / ROCm): split segments.
+                    seg_stride = cache.stride(outer_dims[0]) * el
+                    for seg in range(cache.shape[outer_dims[0]]):
+                        group_base_addrs.append(base_addr + seg * seg_stride)
+                        group_block_lens.append(seg_stride // self.num_blocks)
+                        flat_layer_to_group.append(g_idx)
+            groups.append(
+                GroupLayout(
+                    base_addrs=group_base_addrs,
+                    block_lens=group_block_lens,
+                )
+            )
+
+        # Push into the token_database via the new group-aware API; this
+        # also populates the legacy flat lists for backwards-compat
+        # consumers (e.g. logging below).
+        self.token_database.set_groups(groups, flat_layer_to_group)
+        self.kv_caches_base_addr = self.token_database.kv_caches_base_addr
+        self.block_len = self.token_database.block_len
 
         logger.info(
-            "Registering KV_Caches. use_mla: %s, shape %s, "
-            "num_blocks: %d, block_len: %s, "
-            "per_key_bytes: %d, "
-            "num_segments: %d",
+            "Registering KV_Caches. use_mla: %s, num_groups: %d, "
+            "shape %s, num_blocks: %d, block_len: %s, "
+            "per_key_bytes: %d, num_segments: %d",
             self.use_mla,
+            num_groups,
             first_kv_cache.shape,
             self.num_blocks,
             list(set(self.block_len)),
             sum(self.block_len),
             len(self.kv_caches_base_addr),
         )
-
-        self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
-        self.token_database.set_block_len(self.block_len)
 
         # Start transfer threads
         if self.kv_role in ["kv_producer", "kv_both"]:

@@ -212,3 +212,81 @@ def test_is_chunk_savable_intersection_of_groups():
     assert db.is_chunk_savable(start=11 * block_size, block_ids=block_ids) is True
     assert db.is_chunk_savable(start=19 * block_size, block_ids=block_ids) is True
     assert db.is_chunk_savable(start=20 * block_size, block_ids=block_ids) is False
+
+
+# ---------------------------------------------------------------------------
+# Task 4: worker register_kv_caches buckets layers by KV cache group
+# ---------------------------------------------------------------------------
+from unittest.mock import patch  # noqa: E402
+
+import torch  # noqa: E402
+
+
+@pytest.mark.cpu_test
+def test_register_kv_caches_buckets_by_kv_cache_group():
+    """Mixed FA + SWA layers must be split into two GroupLayouts."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
+        mooncake_store_worker,
+    )
+
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        block_size=block_size,
+    )
+    kv_cache_config = make_kv_cache_config(
+        block_size=block_size, swa_enabled=True,
+    )
+    # FA group claims layer0 + layer2; SWA group claims layer1 + layer3.
+
+    worker = mooncake_store_worker.MooncakeStoreWorker.__new__(
+        mooncake_store_worker.MooncakeStoreWorker,
+    )
+    worker.kv_cache_config = kv_cache_config
+    worker.cache_config = vllm_config.cache_config
+    worker.cache_config.num_gpu_blocks = 4
+    worker.num_blocks = 4
+    worker.block_size = block_size
+    worker.use_mla = False
+    worker.tp_size = 1
+    worker.tp_rank = 0
+    worker.put_step = 1
+    worker.kv_role = "kv_both"
+    worker.metadata = mooncake_store_worker.KeyMetadata(
+        model_name="m", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0,
+    )
+    worker.token_database = mooncake_store_worker.ChunkedTokenDatabase(
+        worker.metadata, block_size=block_size,
+    )
+    worker.store = MagicMock()
+    worker.store.register_buffer = MagicMock(return_value=0)
+    worker.kv_send_thread = None
+    worker.kv_recv_thread = None
+    worker.enable_kv_events = False
+    worker.disk_offload_buffer_budget_bytes = None
+    worker.replicate_config = None
+    worker.preferred_segment = None
+    worker.store_replicate_config = None
+
+    # MLA-style blocks-first layout: (num_blocks, block_size, head_size).
+    fa_tensor = torch.zeros((4, 16, 64), dtype=torch.float16)
+    sw_tensor = torch.zeros((4, 16, 64), dtype=torch.float16)
+    kv_caches = {
+        "layer0": fa_tensor, "layer2": fa_tensor.clone(),
+        "layer1": sw_tensor, "layer3": sw_tensor.clone(),
+    }
+    with patch.object(
+        mooncake_store_worker, "KVCacheStoreSendingThread"
+    ), patch.object(
+        mooncake_store_worker, "KVCacheStoreRecvingThread"
+    ), patch.object(mooncake_store_worker.threading, "Event") as mock_event:
+        # Avoid blocking on ready_event_recving.wait().
+        mock_event.return_value.wait = MagicMock()
+        worker.register_kv_caches(kv_caches)
+
+    db = worker.token_database
+    assert len(db.groups) == 2
+    assert len(db.groups[0].base_addrs) == 2  # FA: 2 layers
+    assert len(db.groups[1].base_addrs) == 2  # SWA: 2 layers
+    assert db.layer_to_group == [0, 0, 1, 1]

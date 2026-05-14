@@ -142,13 +142,14 @@ serving:
           --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"load_async":true,"enable_cross_layers_blocks":true,"enable_offload":true}}'
         env:
           # Connection params for the vllm-side MooncakeStoreConfig.
-          MOONCAKE_MODE: "owner-client"
-          MOONCAKE_CONFIG_PATH: "/home/${USER}/repos/vllm-mooncake/scripts/mooncake/mooncake_config.json"
+          # mode + metadata_server + device_name live in the JSON.
+          # mooncake_config_http_fixed_nics.json pins the RNIC CSV
+          # ("rocep139s0,rocep140s0,rocep195s0,rocep196s0") to bypass
+          # Python auto-discovery; CSV position N → vllm rank with local
+          # GPU N picks entries[N]. Edit the JSON to match your topology.
+          MOONCAKE_CONFIG_PATH: "/home/${USER}/repos/vllm-mooncake/scripts/mooncake/mooncake_config_http_fixed_nics.json"
           # Steer this rank to the owner we just spawned (same node, port 50053).
           MOONCAKE_PREFERRED_SEGMENT: "127.0.0.1:50053"
-          # FIXED-NIC override — bypasses Python auto-discovery.
-          # CSV position N → vllm rank with local GPU N picks entries[N].
-          MOONCAKE_DEVICE: "rocep139s0,rocep140s0,rocep195s0,rocep196s0"
           # vLLM-side tier logging.
           VLLM_MOONCAKE_STORE_TIER_LOG: "1"
           GLOG_v: "1"

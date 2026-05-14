@@ -142,7 +142,9 @@ serving:
           --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"load_async":true,"enable_cross_layers_blocks":true,"enable_offload":true}}'
         env:
           # Connection params for the vllm-side MooncakeStoreConfig.
-          MOONCAKE_MODE: "owner-client"
+          # mode + metadata_server live in the JSON; mooncake_config.json
+          # uses metadata_server="http://127.0.0.1:8080/metadata" to match
+          # the HTTP-metadata variant of the master started in pre_serve[0].
           MOONCAKE_CONFIG_PATH: "/home/${USER}/repos/vllm-mooncake/scripts/mooncake/mooncake_config.json"
           # Steer this rank to the owner we just spawned (same node, port 50053).
           MOONCAKE_PREFERRED_SEGMENT: "127.0.0.1:50053"

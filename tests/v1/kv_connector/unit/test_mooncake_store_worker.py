@@ -283,101 +283,37 @@ def test_get_configured_worker_rnic_selects_device_from_explicit_csv(monkeypatch
     )
 
 
-def test_get_configured_worker_rnic_falls_back_to_mooncake(monkeypatch):
-    """When no CSV is given AND auto-discovery cannot map the local GPU,
-    fall back to Mooncake's own auto-selection (returns "")."""
-    store_config = mooncake_store_worker.MooncakeStoreConfig(
-        metadata_server="",
-        local_buffer_size=1,
-        protocol="rdma",
-        device_name="",
-        master_server_address="",
-    )
-    # Force auto-discovery to fail (no GPU/RNIC mapping).
-    monkeypatch.setattr(rdma_utils, "_autodiscover_worker_rnic", lambda: "")
-
-    assert (
-        rdma_utils.get_configured_worker_rnic(
-            protocol=store_config.protocol,
-            configured_device=store_config.device_name,
-        )
-        == ""
-    )
-
-
-def test_get_configured_worker_rnic_uses_python_autodiscovery(monkeypatch):
-    """When no CSV is given but auto-discovery returns a mapping, use it."""
-    monkeypatch.setattr(rdma_utils, "_autodiscover_worker_rnic", lambda: "rocep139s0")
-    assert (
-        rdma_utils.get_configured_worker_rnic(
+def test_get_configured_worker_rnic_warns_and_returns_empty_for_rdma_with_no_device(
+    caplog, monkeypatch
+):
+    """No device configured + protocol=rdma → emit a clear warning and return ""
+    so the C++ side handles auto-selection. There is no Python-side fallback."""
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
+    with caplog.at_level(logging.WARNING):
+        result = rdma_utils.get_configured_worker_rnic(
             protocol="rdma",
             configured_device="",
         )
-        == "rocep139s0"
+    assert result == ""
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("No RDMA devices specified" in r.message for r in warnings), (
+        f"expected fallback warning, got {[r.message for r in warnings]}"
     )
 
 
-def test_autodiscover_worker_rnic_picks_per_gpu(monkeypatch):
-    """The 3-phase assignment maps each GPU to its PCI-affine RNIC, using
-    netdev-name exact match (gpu<N>rdma<M>) as phase A."""
-    gpus = [
-        rdma_utils._GpuInfo(index=0, pci_bus="0000:89:00.0", numa=0),
-        rdma_utils._GpuInfo(index=1, pci_bus="0000:8a:00.0", numa=0),
-        rdma_utils._GpuInfo(index=2, pci_bus="0000:c1:00.0", numa=1),
-        rdma_utils._GpuInfo(index=3, pci_bus="0000:c2:00.0", numa=1),
-    ]
-    rnics = [
-        rdma_utils._RdmaDevice(
-            name="rocep139s0",
-            pci_bus="0000:8b:00.0",
-            numa=0,
-            netdevs=("gpu0rdma0",),
-        ),
-        rdma_utils._RdmaDevice(
-            name="rocep140s0",
-            pci_bus="0000:8c:00.0",
-            numa=0,
-            netdevs=("gpu1rdma0",),
-        ),
-        rdma_utils._RdmaDevice(
-            name="rocep195s0",
-            pci_bus="0000:c3:00.0",
-            numa=1,
-            netdevs=("gpu2rdma0",),
-        ),
-        rdma_utils._RdmaDevice(
-            name="rocep196s0",
-            pci_bus="0000:c4:00.0",
-            numa=1,
-            netdevs=("gpu3rdma0",),
-        ),
-    ]
-    mapping = rdma_utils._assign_rnic_per_gpu(gpus, rnics)
-    assert mapping == {
-        0: "rocep139s0",
-        1: "rocep140s0",
-        2: "rocep195s0",
-        3: "rocep196s0",
-    }
-
-
-def test_autodiscover_worker_rnic_uses_numa_pci_when_no_netdev_match():
-    """When netdev names don't follow the gpu<N>rdma<M> convention, fall back
-    to same-NUMA + minimum PCI-bus-distance (phase B)."""
-    gpus = [
-        rdma_utils._GpuInfo(index=0, pci_bus="0000:10:00.0", numa=0),
-        rdma_utils._GpuInfo(index=1, pci_bus="0000:60:00.0", numa=1),
-    ]
-    rnics = [
-        rdma_utils._RdmaDevice(
-            name="mlx5_0", pci_bus="0000:15:00.0", numa=0, netdevs=("ib0",)
-        ),
-        rdma_utils._RdmaDevice(
-            name="mlx5_1", pci_bus="0000:65:00.0", numa=1, netdevs=("ib1",)
-        ),
-    ]
-    mapping = rdma_utils._assign_rnic_per_gpu(gpus, rnics)
-    assert mapping == {0: "mlx5_0", 1: "mlx5_1"}
+def test_get_configured_worker_rnic_silent_for_tcp_with_no_device(caplog, monkeypatch):
+    """protocol=tcp + no device → return "" silently (no RDMA, no warning)."""
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
+    with caplog.at_level(logging.WARNING):
+        result = rdma_utils.get_configured_worker_rnic(
+            protocol="tcp",
+            configured_device="",
+        )
+    assert result == ""
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert not any("RDMA" in r.message for r in warnings), (
+        f"did not expect RDMA warning for tcp protocol, got {[r.message for r in warnings]}"
+    )
 
 
 def test_get_configured_worker_rnic_rejects_short_explicit_csv(monkeypatch):

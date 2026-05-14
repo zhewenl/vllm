@@ -5,6 +5,6 @@
   "global_segment_size": "4GB",
   "local_buffer_size": "4GB",
   "protocol": "rdma",
-  "device_name": "",
+  "device_name": "rocep139s0,rocep140s0,rocep195s0,rocep196s0",
   "enable_offload": false
 }

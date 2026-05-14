@@ -144,9 +144,9 @@ serving:
           # Connection params for the vllm-side MooncakeStoreConfig.
           # mode + metadata_server + device_name live in the JSON.
           # mooncake_config_http_fixed_nics.json pins the RNIC CSV
-          # ("rocep139s0,rocep140s0,rocep195s0,rocep196s0") to bypass
-          # Python auto-discovery; CSV position N → vllm rank with local
-          # GPU N picks entries[N]. Edit the JSON to match your topology.
+          # ("rocep139s0,rocep140s0,rocep195s0,rocep196s0"). CSV position N
+          # → vllm rank with local GPU N picks entries[N]. Edit the JSON to
+          # match your topology — there is no Python-side auto-discovery.
           MOONCAKE_CONFIG_PATH: "/home/${USER}/repos/vllm-mooncake/scripts/mooncake/mooncake_config_http_fixed_nics.json"
           # Steer this rank to the owner we just spawned (same node, port 50053).
           MOONCAKE_PREFERRED_SEGMENT: "127.0.0.1:50053"

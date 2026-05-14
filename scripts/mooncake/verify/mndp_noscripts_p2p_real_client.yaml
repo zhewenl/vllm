@@ -108,7 +108,11 @@ serving:
         env:
           # Connection params for the vllm-side MooncakeStoreConfig.
           # mode=real-client + global_segment_size="4GB" + enable_offload=false
-          # all live in the JSON.
+          # all live in the JSON. The JSON's "device_name" is set to the
+          # GB200 4-NIC CSV (rocep139s0,rocep140s0,rocep195s0,rocep196s0);
+          # edit it for your topology. No Python-side auto-discovery — if
+          # device_name is empty the connector warns and Mooncake's C++
+          # auto-select takes over.
           MOONCAKE_CONFIG_PATH: "/home/${USER}/repos/vllm-mooncake/scripts/mooncake/mooncake_config_real_client.json"
           # vLLM-side tier logging (expect memory_keys only, disk_keys=0).
           VLLM_MOONCAKE_STORE_TIER_LOG: "1"

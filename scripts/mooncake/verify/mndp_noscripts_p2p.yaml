@@ -141,6 +141,11 @@ serving:
           # Connection params for the vllm-side MooncakeStoreConfig.
           # mode + metadata_server live in the JSON; this variant uses the
           # P2P config (metadata_server=P2PHANDSHAKE, mode=owner-client).
+          # The JSON's "device_name" is set to the GB200 4-NIC CSV
+          # (rocep139s0,rocep140s0,rocep195s0,rocep196s0); edit it for your
+          # topology. No Python-side auto-discovery — if device_name is empty
+          # the connector warns and Mooncake's C++ auto-select takes over,
+          # which may converge on the same NIC across all DP ranks.
           MOONCAKE_CONFIG_PATH: "/home/${USER}/repos/vllm-mooncake/scripts/mooncake/mooncake_config_p2p.json"
           # Steer this rank to the owner we just spawned (same node, port 50053).
           MOONCAKE_PREFERRED_SEGMENT: "127.0.0.1:50053"

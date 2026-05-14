@@ -17,9 +17,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
     rdma_utils,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
-    worker as mooncake_store_worker,
+    worker,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     ChunkedTokenDatabase,
     KeyMetadata,
     LoadSpec,
@@ -31,13 +31,13 @@ def _make_store_sending_thread(
     store: MagicMock,
     *,
     replicate_config: object | None = None,
-) -> mooncake_store_worker.KVCacheStoreSendingThread:
+) -> worker.KVCacheStoreSendingThread:
     token_database = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0), block_size=16
     )
     token_database.set_kv_caches_base_addr([0x1000])
     token_database.set_block_len([256])
-    thread = mooncake_store_worker.KVCacheStoreSendingThread(
+    thread = worker.KVCacheStoreSendingThread(
         store=store,
         token_database=token_database,
         block_size=16,
@@ -55,13 +55,13 @@ def _make_store_recving_thread(
     store: MagicMock,
     *,
     disk_offload_buffer_budget_bytes: int | None = None,
-) -> mooncake_store_worker.KVCacheStoreRecvingThread:
+) -> worker.KVCacheStoreRecvingThread:
     token_database = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0), block_size=16
     )
     token_database.set_kv_caches_base_addr([0x1000])
     token_database.set_block_len([256])
-    thread = mooncake_store_worker.KVCacheStoreRecvingThread(
+    thread = worker.KVCacheStoreRecvingThread(
         store=store,
         token_database=token_database,
         block_size=16,
@@ -105,9 +105,7 @@ def _make_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMeta:
     )
 
 
-_DISK_OFFLOAD_SINGLE_KEY_BYTES = (
-    mooncake_store_worker._estimate_disk_offload_staging_bytes([256])
-)
+_DISK_OFFLOAD_SINGLE_KEY_BYTES = worker._estimate_disk_offload_staging_bytes([256])
 _DISK_OFFLOAD_USABLE_BUDGET_RATIO = 0.9
 _DISK_OFFLOAD_BUDGET_FOR_THREE_KEYS = 4 * _DISK_OFFLOAD_SINGLE_KEY_BYTES
 _DISK_OFFLOAD_BUDGET_FOR_SPLIT = math.ceil(
@@ -181,28 +179,18 @@ def _install_fake_mooncake(monkeypatch, store_instance: MagicMock):
 
 def _patch_worker_runtime(monkeypatch, *, local_ip: str = "10.0.0.7") -> None:
     single_rank_group = SimpleNamespace(world_size=1, rank_in_group=0)
-    monkeypatch.setattr(
-        mooncake_store_worker, "get_mooncake_dp_engine_index", lambda _: 0
-    )
-    monkeypatch.setattr(
-        mooncake_store_worker, "get_tensor_model_parallel_rank", lambda: 0
-    )
-    monkeypatch.setattr(
-        mooncake_store_worker, "get_tensor_model_parallel_world_size", lambda: 1
-    )
-    monkeypatch.setattr(
-        mooncake_store_worker, "get_pcp_group", lambda: single_rank_group
-    )
-    monkeypatch.setattr(
-        mooncake_store_worker, "get_dcp_group", lambda: single_rank_group
-    )
-    monkeypatch.setattr(mooncake_store_worker, "get_ip", lambda: local_ip)
+    monkeypatch.setattr(worker, "get_mooncake_dp_engine_index", lambda _: 0)
+    monkeypatch.setattr(worker, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(worker, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(worker, "get_pcp_group", lambda: single_rank_group)
+    monkeypatch.setattr(worker, "get_dcp_group", lambda: single_rank_group)
+    monkeypatch.setattr(worker, "get_ip", lambda: local_ip)
 
 
 def test_default_local_buffer_size_matches_pr40900():
     """PR-40900 shipped a 4 GiB default for local_buffer_size; the dual-mode
     patch preserves it (and the JSON key) so unchanged PR-40900 configs work."""
-    assert mooncake_store_worker.DEFAULT_LOCAL_BUFFER_SIZE == 4 * 1024**3
+    assert worker.DEFAULT_LOCAL_BUFFER_SIZE == 4 * 1024**3
 
 
 def test_get_requester_local_hostname_prefers_override(monkeypatch):
@@ -243,7 +231,7 @@ def test_get_configured_preferred_segment_rejects_empty_override():
 
 
 def test_get_configured_worker_rnic_prefers_explicit_device_name(monkeypatch):
-    store_config = mooncake_store_worker.MooncakeStoreConfig(
+    store_config = worker.MooncakeStoreConfig(
         metadata_server="",
         local_buffer_size=1,
         protocol="rdma",
@@ -266,7 +254,7 @@ def test_get_configured_worker_rnic_selects_device_from_explicit_csv(monkeypatch
         "get_current_physical_gpu_index",
         lambda: 1,
     )
-    store_config = mooncake_store_worker.MooncakeStoreConfig(
+    store_config = worker.MooncakeStoreConfig(
         metadata_server="",
         local_buffer_size=1,
         protocol="rdma",
@@ -436,7 +424,7 @@ def test_get_disk_offload_buffer_budget_bytes_uses_requester_budget_override(
     monkeypatch.setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "2mb")
 
     assert (
-        mooncake_store_worker._get_disk_offload_buffer_budget_bytes(enable_offload=True)
+        worker._get_disk_offload_buffer_budget_bytes(enable_offload=True)
         == 2 * 1024 * 1024
     )
 
@@ -445,24 +433,17 @@ def test_get_disk_offload_buffer_budget_bytes_uses_requester_default(monkeypatch
     monkeypatch.delenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", raising=False)
 
     assert (
-        mooncake_store_worker._get_disk_offload_buffer_budget_bytes(enable_offload=True)
-        == mooncake_store_worker.DEFAULT_MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE
+        worker._get_disk_offload_buffer_budget_bytes(enable_offload=True)
+        == worker.DEFAULT_MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE
     )
 
 
 def test_get_disk_offload_buffer_budget_bytes_returns_none_when_disabled():
-    assert (
-        mooncake_store_worker._get_disk_offload_buffer_budget_bytes(
-            enable_offload=False
-        )
-        is None
-    )
+    assert worker._get_disk_offload_buffer_budget_bytes(enable_offload=False) is None
 
 
 def test_estimate_disk_offload_staging_bytes_sums_multi_segment_sizes():
-    assert (
-        mooncake_store_worker._estimate_disk_offload_staging_bytes([256, 512]) == 12288
-    )
+    assert worker._estimate_disk_offload_staging_bytes([256, 512]) == 12288
 
 
 def test_recv_thread_uses_single_batch_when_no_disk_offload_budget(monkeypatch):
@@ -492,7 +473,7 @@ def test_recv_thread_uses_single_batch_when_no_disk_offload_budget(monkeypatch):
 
 def test_recv_thread_logs_tier_summary_when_enabled(monkeypatch, caplog_vllm):
     monkeypatch.setenv("VLLM_MOONCAKE_STORE_TIER_LOG", "1")
-    caplog_vllm.set_level(logging.INFO, logger=mooncake_store_worker.logger.name)
+    caplog_vllm.set_level(logging.INFO, logger=worker.logger.name)
 
     store = MagicMock()
     store.batch_get_into_multi_buffers.return_value = [256, 256, -10]
@@ -691,9 +672,9 @@ def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
             },
         ),
     )
-    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+    w = worker.MooncakeStoreWorker(_make_vllm_config())
 
-    assert not hasattr(worker, "_isolate_offload_resources")
+    assert not hasattr(w, "_isolate_offload_resources")
     assert store.setup.call_args.args == (
         "10.0.0.7",
         "http://metadata/endpoint",
@@ -727,7 +708,7 @@ def test_requester_worker_init_prefers_local_hostname_override(
             },
         ),
     )
-    mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+    worker.MooncakeStoreWorker(_make_vllm_config())
 
     assert store.setup.call_args.args[0] == "worker-a:50053"
 
@@ -757,9 +738,9 @@ def test_requester_worker_init_skips_disk_budget_when_offload_disabled(
             },
         ),
     )
-    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+    w = worker.MooncakeStoreWorker(_make_vllm_config())
 
-    assert worker.disk_offload_buffer_budget_bytes is None
+    assert w.disk_offload_buffer_budget_bytes is None
 
 
 def test_requester_worker_init_builds_replicate_config_for_preferred_segment(
@@ -782,7 +763,7 @@ def test_requester_worker_init_builds_replicate_config_for_preferred_segment(
             },
         ),
     )
-    worker = mooncake_store_worker.MooncakeStoreWorker(
+    w = worker.MooncakeStoreWorker(
         _make_vllm_config(
             extra_config={
                 "preferred_segment": "10.0.0.7:50053",
@@ -790,8 +771,8 @@ def test_requester_worker_init_builds_replicate_config_for_preferred_segment(
         )
     )
 
-    assert isinstance(worker.store_replicate_config, fake_replicate_config_cls)
-    assert worker.store_replicate_config.preferred_segment == "10.0.0.7:50053"
+    assert isinstance(w.store_replicate_config, fake_replicate_config_cls)
+    assert w.store_replicate_config.preferred_segment == "10.0.0.7:50053"
 
 
 # ---------------------------------------------------------------------------
@@ -815,31 +796,31 @@ def _make_bare_worker(
     num_gpu_blocks: int = 10,
     block_size: int = 16,
     kv_role: str = "kv_both",
-) -> mooncake_store_worker.MooncakeStoreWorker:
+) -> worker.MooncakeStoreWorker:
     """Construct a MooncakeStoreWorker via __new__, bypassing __init__.
 
     Sets only the attributes that register_kv_caches() reads so we can
     test the stride-based layout detection without a real
     MooncakeDistributedStore.
     """
-    worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
-    worker.cache_config = MagicMock()
-    worker.cache_config.num_gpu_blocks = num_gpu_blocks
-    worker.store = MagicMock()
-    worker.store.register_buffer.return_value = 0
-    worker.use_mla = False
-    worker.token_database = ChunkedTokenDatabase(
+    w = object.__new__(worker.MooncakeStoreWorker)
+    w.cache_config = MagicMock()
+    w.cache_config.num_gpu_blocks = num_gpu_blocks
+    w.store = MagicMock()
+    w.store.register_buffer.return_value = 0
+    w.use_mla = False
+    w.token_database = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0), block_size=block_size
     )
-    worker.kv_role = kv_role
-    worker.block_size = block_size
-    worker.tp_rank = 0
-    worker.put_step = 1
-    worker.enable_kv_events = False
-    worker.disk_offload_buffer_budget_bytes = None
-    worker.kv_send_thread = None
-    worker.kv_recv_thread = None
-    return worker
+    w.kv_role = kv_role
+    w.block_size = block_size
+    w.tp_rank = 0
+    w.put_step = 1
+    w.enable_kv_events = False
+    w.disk_offload_buffer_budget_bytes = None
+    w.kv_send_thread = None
+    w.kv_recv_thread = None
+    return w
 
 
 # ---------------------------------------------------------------------------
@@ -851,7 +832,7 @@ def test_register_kv_caches_blocks_first_single_segment():
     """Blocks-first layout (FlashInfer/MLA): one segment per layer."""
     num_blocks = 10
     page_size_elements = 64  # elements per block
-    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    w = _make_bare_worker(num_gpu_blocks=num_blocks)
 
     # Shape: (num_blocks, page_size_elements) — blocks outermost, no outer_dims
     tensor = torch.zeros(num_blocks, page_size_elements, dtype=torch.float16)
@@ -868,16 +849,16 @@ def test_register_kv_caches_blocks_first_single_segment():
             side_effect=_auto_set_ready_event,
         ),
     ):
-        worker.register_kv_caches({"layer0": tensor})
+        w.register_kv_caches({"layer0": tensor})
 
-    assert len(worker.kv_caches_base_addr) == 1
-    assert worker.kv_caches_base_addr[0] == tensor.untyped_storage().data_ptr()
+    assert len(w.kv_caches_base_addr) == 1
+    assert w.kv_caches_base_addr[0] == tensor.untyped_storage().data_ptr()
 
     expected_block_len = tensor.untyped_storage().nbytes() // num_blocks
-    assert len(worker.block_len) == 1
-    assert worker.block_len[0] == expected_block_len
+    assert len(w.block_len) == 1
+    assert w.block_len[0] == expected_block_len
 
-    worker.store.register_buffer.assert_called_once_with(
+    w.store.register_buffer.assert_called_once_with(
         tensor.untyped_storage().data_ptr(),
         tensor.untyped_storage().nbytes(),
     )
@@ -890,7 +871,7 @@ def test_register_kv_caches_kv_first_two_segments():
     num_kv_heads = 4
     head_size = 8
 
-    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    w = _make_bare_worker(num_gpu_blocks=num_blocks)
 
     # Shape: (2, num_blocks, block_size, num_kv_heads, head_size) — K/V outermost
     tensor = torch.zeros(
@@ -914,19 +895,19 @@ def test_register_kv_caches_kv_first_two_segments():
             side_effect=_auto_set_ready_event,
         ),
     ):
-        worker.register_kv_caches({"layer0": tensor})
+        w.register_kv_caches({"layer0": tensor})
 
     # K/V-first: dim 0 has stride > page_size, so 2 segments
-    assert len(worker.kv_caches_base_addr) == 2
-    assert len(worker.block_len) == 2
+    assert len(w.kv_caches_base_addr) == 2
+    assert len(w.block_len) == 2
 
     el = tensor.element_size()
     seg_stride = tensor.stride(0) * el  # stride of the K/V dim in bytes
     base = tensor.untyped_storage().data_ptr()
-    assert worker.kv_caches_base_addr[0] == base
-    assert worker.kv_caches_base_addr[1] == base + seg_stride
-    assert worker.block_len[0] == seg_stride // num_blocks
-    assert worker.block_len[1] == seg_stride // num_blocks
+    assert w.kv_caches_base_addr[0] == base
+    assert w.kv_caches_base_addr[1] == base + seg_stride
+    assert w.block_len[0] == seg_stride // num_blocks
+    assert w.block_len[1] == seg_stride // num_blocks
 
 
 def test_register_kv_caches_cross_layer_single_segment():
@@ -935,7 +916,7 @@ def test_register_kv_caches_cross_layer_single_segment():
     num_layers = 4
     per_layer_page_elements = 64  # elements per layer per block
 
-    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    w = _make_bare_worker(num_gpu_blocks=num_blocks)
 
     # Cross-layer blocks-first tensor: all layers packed into a single
     # contiguous block.  Shape (num_blocks, num_layers * per_layer_page)
@@ -956,10 +937,10 @@ def test_register_kv_caches_cross_layer_single_segment():
         ),
     ):
         # Use the cross-layer wrapper key, same as register_cross_layers_kv_caches
-        worker.register_kv_caches({"__cross_layer__": tensor})
+        w.register_kv_caches({"__cross_layer__": tensor})
 
-    assert len(worker.kv_caches_base_addr) == 1
-    assert worker.kv_caches_base_addr[0] == tensor.untyped_storage().data_ptr()
+    assert len(w.kv_caches_base_addr) == 1
+    assert w.kv_caches_base_addr[0] == tensor.untyped_storage().data_ptr()
 
     expected_block_len = tensor.untyped_storage().nbytes() // num_blocks
     # block_len should be per_layer_page_size * num_layers
@@ -967,11 +948,11 @@ def test_register_kv_caches_cross_layer_single_segment():
         expected_block_len
         == num_layers * per_layer_page_elements * tensor.element_size()
     )
-    assert len(worker.block_len) == 1
-    assert worker.block_len[0] == expected_block_len
+    assert len(w.block_len) == 1
+    assert w.block_len[0] == expected_block_len
 
     # Also verify via register_cross_layers_kv_caches wrapper
-    worker2 = _make_bare_worker(num_gpu_blocks=num_blocks)
+    w2 = _make_bare_worker(num_gpu_blocks=num_blocks)
     with (
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
@@ -984,10 +965,10 @@ def test_register_kv_caches_cross_layer_single_segment():
             side_effect=_auto_set_ready_event,
         ),
     ):
-        worker2.register_cross_layers_kv_caches(tensor)
+        w2.register_cross_layers_kv_caches(tensor)
 
-    assert worker2.kv_caches_base_addr == worker.kv_caches_base_addr
-    assert worker2.block_len == worker.block_len
+    assert w2.kv_caches_base_addr == w.kv_caches_base_addr
+    assert w2.block_len == w.block_len
 
 
 # ---------------------------------------------------------------------------
@@ -1008,15 +989,15 @@ def _make_config(**overrides):
         device_name="mlx5_0",
     )
     base.update(overrides)
-    return mooncake_store_worker.MooncakeStoreConfig(**base)
+    return worker.MooncakeStoreConfig(**base)
 
 
 def test_config_defaults_to_real_client():
     """A JSON without explicit mode parses as real-client with 4 GiB segment."""
     cfg = _make_config()
     assert cfg.mode == "real-client"
-    assert cfg.global_segment_size == mooncake_store_worker.DEFAULT_GLOBAL_SEGMENT_SIZE
-    assert cfg.local_buffer_size == mooncake_store_worker.DEFAULT_LOCAL_BUFFER_SIZE
+    assert cfg.global_segment_size == worker.DEFAULT_GLOBAL_SEGMENT_SIZE
+    assert cfg.local_buffer_size == worker.DEFAULT_LOCAL_BUFFER_SIZE
     assert cfg.enable_offload is False
 
 
@@ -1034,7 +1015,7 @@ def test_config_pr40900_unchanged(tmp_path):
             "master_server_address": "10.0.0.7:50051",
         },
     )
-    cfg = mooncake_store_worker.MooncakeStoreConfig.from_file(config_path)
+    cfg = worker.MooncakeStoreConfig.from_file(config_path)
     assert cfg.mode == "real-client"
     assert cfg.global_segment_size == 4 * 1024**3
     assert cfg.local_buffer_size == 4 * 1024**3
@@ -1106,7 +1087,7 @@ def test_topology_owner_client_with_disk_offload(tmp_path, monkeypatch):
         ),
     )
 
-    worker = mooncake_store_worker.MooncakeStoreWorker(
+    w = worker.MooncakeStoreWorker(
         _make_vllm_config(extra_config={"preferred_segment": "10.0.0.7:50053"})
     )
 
@@ -1121,11 +1102,11 @@ def test_topology_owner_client_with_disk_offload(tmp_path, monkeypatch):
         "10.0.0.7:50051",
     )
     # ReplicateConfig is built and carries the preferred_segment.
-    assert isinstance(worker.store_replicate_config, fake_replicate_config_cls)
-    assert worker.store_replicate_config.preferred_segment == "10.0.0.7:50053"
+    assert isinstance(w.store_replicate_config, fake_replicate_config_cls)
+    assert w.store_replicate_config.preferred_segment == "10.0.0.7:50053"
     # Disk-offload staging budget is allocated (enable_offload=True).
-    assert worker.disk_offload_buffer_budget_bytes is not None
-    assert worker.disk_offload_buffer_budget_bytes > 0
+    assert w.disk_offload_buffer_budget_bytes is not None
+    assert w.disk_offload_buffer_budget_bytes > 0
 
 
 def test_topology_real_client_cpu_only(tmp_path, monkeypatch):
@@ -1151,7 +1132,7 @@ def test_topology_real_client_cpu_only(tmp_path, monkeypatch):
         ),
     )
 
-    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+    w = worker.MooncakeStoreWorker(_make_vllm_config())
 
     # setup() receives global_segment_size=4 GiB (rank contributes a segment).
     assert store.setup.call_args.args == (
@@ -1164,7 +1145,7 @@ def test_topology_real_client_cpu_only(tmp_path, monkeypatch):
         "10.0.0.7:50051",
     )
     # No preferred_segment, no ReplicateConfig.
-    assert worker.preferred_segment is None
-    assert worker.store_replicate_config is None
+    assert w.preferred_segment is None
+    assert w.store_replicate_config is None
     # No disk budget — enable_offload was absent (defaults to False).
-    assert worker.disk_offload_buffer_budget_bytes is None
+    assert w.disk_offload_buffer_budget_bytes is None

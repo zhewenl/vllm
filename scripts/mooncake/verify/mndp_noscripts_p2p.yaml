@@ -139,11 +139,11 @@ serving:
           --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"load_async":true,"enable_cross_layers_blocks":true,"enable_offload":true}}'
         env:
           # Connection params for the vllm-side MooncakeStoreConfig.
-          MOONCAKE_MODE: "owner-client"
-          MOONCAKE_CONFIG_PATH: "/home/${USER}/repos/vllm-mooncake/scripts/mooncake/mooncake_config.json"
+          # mode + metadata_server live in the JSON; this variant uses the
+          # P2P config (metadata_server=P2PHANDSHAKE, mode=owner-client).
+          MOONCAKE_CONFIG_PATH: "/home/${USER}/repos/vllm-mooncake/scripts/mooncake/mooncake_config_p2p.json"
           # Steer this rank to the owner we just spawned (same node, port 50053).
           MOONCAKE_PREFERRED_SEGMENT: "127.0.0.1:50053"
-          MOONCAKE_TE_META_DATA_SERVER: "P2PHANDSHAKE"
           # vLLM-side tier logging.
           VLLM_MOONCAKE_STORE_TIER_LOG: "1"
           GLOG_v: "1"

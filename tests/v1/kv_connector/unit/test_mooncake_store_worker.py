@@ -1133,3 +1133,102 @@ def test_config_unknown_mode():
 def test_config_zero_local_buffer():
     with pytest.raises(ValueError, match=r"local_buffer_size must be > 0"):
         _make_config(local_buffer_size=0)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end topology tests
+# Covers the two supported recipes:
+#   (A) owner-client mode + disk offload (mode="owner-client", segment=0,
+#       enable_offload=true, preferred_segment set)
+#   (B) real-client mode + CPU only      (mode default, segment>0,
+#       enable_offload=false, no preferred_segment)
+# ---------------------------------------------------------------------------
+
+
+def test_topology_owner_client_with_disk_offload(tmp_path, monkeypatch):
+    """owner-client + disk: global_segment_size=0, enable_offload=True,
+    preferred_segment set. Assert setup() positional args, ReplicateConfig
+    wiring, and that the disk-offload buffer budget is allocated."""
+    store = MagicMock()
+    store.setup.return_value = 0
+    fake_replicate_config_cls = _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    monkeypatch.setenv(
+        "MOONCAKE_CONFIG_PATH",
+        _write_mooncake_config(
+            tmp_path,
+            {
+                "mode": "owner-client",
+                "metadata_server": "http://metadata/endpoint",
+                "global_segment_size": 0,
+                "local_buffer_size": "1GB",
+                "protocol": "rdma",
+                "device_name": "mlx5_0",
+                "master_server_address": "10.0.0.7:50051",
+                "enable_offload": True,
+            },
+        ),
+    )
+
+    worker = mooncake_store_worker.MooncakeStoreWorker(
+        _make_vllm_config(extra_config={"preferred_segment": "10.0.0.7:50053"})
+    )
+
+    # setup() receives global_segment_size=0 and the configured local buffer.
+    assert store.setup.call_args.args == (
+        "10.0.0.7",
+        "http://metadata/endpoint",
+        0,
+        1024 * 1024 * 1024,
+        "rdma",
+        "mlx5_0",
+        "10.0.0.7:50051",
+    )
+    # ReplicateConfig is built and carries the preferred_segment.
+    assert isinstance(worker.store_replicate_config, fake_replicate_config_cls)
+    assert worker.store_replicate_config.preferred_segment == "10.0.0.7:50053"
+    # Disk-offload staging budget is allocated (enable_offload=True).
+    assert worker.disk_offload_buffer_budget_bytes is not None
+    assert worker.disk_offload_buffer_budget_bytes > 0
+
+
+def test_topology_real_client_cpu_only(tmp_path, monkeypatch):
+    """real-client + CPU-only: no mode key (defaults to real-client),
+    global_segment_size>0, enable_offload absent, no preferred_segment.
+    This is the PR-40900 baseline recipe."""
+    store = MagicMock()
+    store.setup.return_value = 0
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    monkeypatch.setenv(
+        "MOONCAKE_CONFIG_PATH",
+        _write_mooncake_config(
+            tmp_path,
+            {
+                "metadata_server": "http://metadata/endpoint",
+                "global_segment_size": "4GB",
+                "local_buffer_size": "4GB",
+                "protocol": "rdma",
+                "device_name": "mlx5_0",
+                "master_server_address": "10.0.0.7:50051",
+            },
+        ),
+    )
+
+    worker = mooncake_store_worker.MooncakeStoreWorker(_make_vllm_config())
+
+    # setup() receives global_segment_size=4 GiB (rank contributes a segment).
+    assert store.setup.call_args.args == (
+        "10.0.0.7",
+        "http://metadata/endpoint",
+        4 * 1024 * 1024 * 1024,
+        4 * 1024 * 1024 * 1024,
+        "rdma",
+        "mlx5_0",
+        "10.0.0.7:50051",
+    )
+    # No preferred_segment, no ReplicateConfig.
+    assert worker.preferred_segment is None
+    assert worker.store_replicate_config is None
+    # No disk budget — enable_offload was absent (defaults to False).
+    assert worker.disk_offload_buffer_budget_bytes is None

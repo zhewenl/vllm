@@ -50,8 +50,8 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 logger = init_logger(__name__)
 
-DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB — PR-40900 default
-DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB — PR-40900 default
+DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
+DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
 DEFAULT_MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE = 1280 * 1024 * 1024
 DISK_OFFLOAD_USABLE_BUDGET_RATIO = 0.9
@@ -95,30 +95,18 @@ class MooncakeStoreConfig:
         with open(file_path) as file:
             config = json.load(file)
         return MooncakeStoreConfig(
-            metadata_server=_get_config_or_env_value(
-                config, "metadata_server", "MOONCAKE_TE_META_DATA_SERVER", ""
-            ),
-            master_server_address=_get_config_or_env_value(
-                config, "master_server_address", "MOONCAKE_MASTER", ""
-            ),
-            protocol=_get_config_or_env_value(
-                config, "protocol", "MOONCAKE_PROTOCOL", "rdma"
-            ),
-            device_name=_get_config_or_env_value(
-                config, "device_name", "MOONCAKE_DEVICE", ""
-            ),
-            mode=_get_config_or_env_value(
-                config, "mode", "MOONCAKE_MODE", "real-client"
-            ),
+            metadata_server=config.get("metadata_server", ""),
+            master_server_address=config.get("master_server_address", ""),
+            protocol=config.get("protocol", "rdma"),
+            device_name=config.get("device_name", ""),
+            mode=config.get("mode", "real-client"),
             global_segment_size=_parse_size(
                 config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
             local_buffer_size=_parse_size(
                 config.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE)
             ),
-            enable_offload=_get_bool_config_or_env_value(
-                config, "enable_offload", "MOONCAKE_ENABLE_OFFLOAD", False
-            ),
+            enable_offload=bool(config.get("enable_offload", False)),
         )
 
     @staticmethod
@@ -129,24 +117,6 @@ class MooncakeStoreConfig:
                 "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
             )
         return MooncakeStoreConfig.from_file(config_path)
-
-
-def _get_config_or_env_value(
-    config: Mapping[str, Any], key: str, env_var: str, default: Any
-) -> Any:
-    env_value = os.getenv(env_var)
-    if env_value not in (None, ""):
-        return env_value
-    return config.get(key, default)
-
-
-def _get_bool_config_or_env_value(
-    config: Mapping[str, Any], key: str, env_var: str, default: bool
-) -> bool:
-    env_value = os.getenv(env_var)
-    if env_value:
-        return env_value.strip().lower() in ("1", "true")
-    return bool(config.get(key, default))
 
 
 def _get_kv_connector_extra_config(vllm_config: VllmConfig) -> Mapping[str, Any]:
@@ -772,7 +742,7 @@ class MooncakeStoreWorker:
 
     def __init__(self, vllm_config: VllmConfig):
         try:
-            from mooncake.store import (  # type: ignore  # noqa: E501
+            from mooncake.store import (  # type: ignore
                 MooncakeDistributedStore,
                 ReplicateConfig,
             )

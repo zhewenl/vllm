@@ -1402,11 +1402,6 @@ class MooncakeStoreWorker:
 
         return finished_sending
 
-    def _ensure_session_lookup_hints(self) -> None:
-        if not hasattr(self, "_session_lookup_hints"):
-            self._session_lookup_hints = OrderedDict()
-            self._session_lookup_hints_lock = threading.Lock()
-
     def _record_session_lookup_hint(
         self,
         session_id: str | None,
@@ -1429,7 +1424,6 @@ class MooncakeStoreWorker:
         if anchor_idx < 0 or anchor_idx >= len(block_hashes):
             return
 
-        self._ensure_session_lookup_hints()
         hint = SessionLookupHint(
             aligned_token_len=aligned_token_len,
             anchor_hash=bytes(block_hashes[anchor_idx]),
@@ -1453,7 +1447,6 @@ class MooncakeStoreWorker:
         ):
             return None
 
-        self._ensure_session_lookup_hints()
         with self._session_lookup_hints_lock:
             hint = self._session_lookup_hints.get(session_id)
             if hint is None:
@@ -1480,7 +1473,6 @@ class MooncakeStoreWorker:
         return hint_len
 
     def clear_session_lookup_hints(self) -> None:
-        self._ensure_session_lookup_hints()
         with self._session_lookup_hints_lock:
             self._session_lookup_hints.clear()
 

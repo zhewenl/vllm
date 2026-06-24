@@ -7,6 +7,7 @@ import math
 import sys
 import threading
 import types
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1351,6 +1352,8 @@ def _make_bare_worker(
 
     worker.disk_offload_buffer_budget_bytes = None
     worker.store_replicate_config = SimpleNamespace()
+    worker._session_lookup_hints = OrderedDict()
+    worker._session_lookup_hints_lock = threading.Lock()
     worker._kv_connector_stats_lock = threading.Lock()
     worker.kv_connector_stats = MooncakeStoreConnectorStats()
 

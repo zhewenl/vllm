@@ -17,7 +17,7 @@ import queue
 import socket
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -88,9 +88,18 @@ DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES = 1280 * 1024 * 1024
 # Mirrors DirectIO alignment in Mooncake's AllocateBatch.
 _DIRECT_IO_ALIGNMENT = 4096
 _DIRECT_IO_PADDING_BYTES = 2 * _DIRECT_IO_ALIGNMENT
+SESSION_LOOKUP_HINT_MAX_ENTRIES = 100_000
 
 
 MooncakeMode = Literal["embedded", "standalone-store"]
+
+
+@dataclass
+class SessionLookupHint:
+    """Last validated store boundary for a request session."""
+
+    aligned_token_len: int
+    anchor_hash: bytes
 
 
 @dataclass
@@ -450,6 +459,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         enable_kv_event: bool = False,
         replicate_config: Any = None,
         record_operation: Callable[..., None] | None = None,
+        record_session_hint: Callable[[str | None, int, Sequence[BlockHash]], None]
+        | None = None,
     ):
         super().__init__(
             store,
@@ -468,6 +479,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Caller always passes a non-None ReplicateConfig — see
         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
         self.replicate_config = replicate_config
+        self._record_session_hint_cb = record_session_hint
 
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
@@ -506,6 +518,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._store_pressure_active = False
             self._skip_store_requests.clear()
         return True
+
+    def _record_session_hint(self, req_meta: ReqMeta, token_len: int) -> None:
+        if (
+            self._record_session_hint_cb is None
+            or not envs.VLLM_MOONCAKE_SESSION_LOOKUP_HINTS
+        ):
+            return
+        self._record_session_hint_cb(
+            req_meta.session_id,
+            token_len,
+            req_meta.block_hashes,
+        )
 
     def _handle_request(self, req_meta: ReqMeta):
         # Cache hits are always a multiple of ``lcm_block_size`` tokens, which
@@ -593,6 +617,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             ]
 
             if not missing_indices:
+                self._record_session_hint(req_meta, token_len)
                 return
 
             starts = [starts[i] for i in missing_indices]
@@ -692,6 +717,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         "Mooncake CPU/disk offloading pressure cleared after a "
                         "successful store batch"
                     )
+                if not failed:
+                    self._record_session_hint(req_meta, token_len)
             except Exception as e:
                 self._record_operation(
                     "save_put",
@@ -1063,6 +1090,8 @@ class MooncakeStoreWorker:
             if store_config.enable_offload
             else None
         )
+        self._session_lookup_hints: OrderedDict[str, SessionLookupHint] = OrderedDict()
+        self._session_lookup_hints_lock = threading.Lock()
 
         # Start lookup server on rank 0 for scheduler-side prefix queries
         self.lookup_server: LookupKeyServer | None = None
@@ -1217,6 +1246,7 @@ class MooncakeStoreWorker:
                 self.enable_kv_events,
                 self.store_replicate_config,
                 record_operation=self._record_kv_connector_operation,
+                record_session_hint=self._record_session_lookup_hint,
             )
             self.kv_send_thread.start()
 
@@ -1372,7 +1402,89 @@ class MooncakeStoreWorker:
 
         return finished_sending
 
-    def lookup(self, token_len: int, block_hashes: Sequence[BlockHash]) -> int:
+    def _ensure_session_lookup_hints(self) -> None:
+        if not hasattr(self, "_session_lookup_hints"):
+            self._session_lookup_hints = OrderedDict()
+            self._session_lookup_hints_lock = threading.Lock()
+
+    def _record_session_lookup_hint(
+        self,
+        session_id: str | None,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+    ) -> None:
+        if (
+            not envs.VLLM_MOONCAKE_SESSION_LOOKUP_HINTS
+            or not session_id
+            or token_len <= 0
+        ):
+            return
+
+        lcm_block_size = self.coord.lcm_block_size
+        aligned_token_len = token_len // lcm_block_size * lcm_block_size
+        if aligned_token_len <= 0 or self.hash_block_size <= 0:
+            return
+
+        anchor_idx = aligned_token_len // self.hash_block_size - 1
+        if anchor_idx < 0 or anchor_idx >= len(block_hashes):
+            return
+
+        self._ensure_session_lookup_hints()
+        hint = SessionLookupHint(
+            aligned_token_len=aligned_token_len,
+            anchor_hash=bytes(block_hashes[anchor_idx]),
+        )
+        with self._session_lookup_hints_lock:
+            self._session_lookup_hints.pop(session_id, None)
+            self._session_lookup_hints[session_id] = hint
+            while len(self._session_lookup_hints) > SESSION_LOOKUP_HINT_MAX_ENTRIES:
+                self._session_lookup_hints.popitem(last=False)
+
+    def _get_session_lookup_hint_len(
+        self,
+        session_id: str | None,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+    ) -> int | None:
+        if (
+            not envs.VLLM_MOONCAKE_SESSION_LOOKUP_HINTS
+            or not session_id
+            or token_len <= 0
+        ):
+            return None
+
+        self._ensure_session_lookup_hints()
+        with self._session_lookup_hints_lock:
+            hint = self._session_lookup_hints.get(session_id)
+            if hint is None:
+                return None
+            self._session_lookup_hints.move_to_end(session_id)
+
+        if hint.aligned_token_len > token_len:
+            return None
+        hint_len = (
+            hint.aligned_token_len
+            // self.coord.lcm_block_size
+            * self.coord.lcm_block_size
+        )
+        if hint_len <= 0 or self.hash_block_size <= 0:
+            return None
+        anchor_idx = hint_len // self.hash_block_size - 1
+        if anchor_idx < 0 or anchor_idx >= len(block_hashes):
+            return None
+        if bytes(block_hashes[anchor_idx]) != hint.anchor_hash:
+            with self._session_lookup_hints_lock:
+                if self._session_lookup_hints.get(session_id) is hint:
+                    self._session_lookup_hints.pop(session_id, None)
+            return None
+        return hint_len
+
+    def clear_session_lookup_hints(self) -> None:
+        self._ensure_session_lookup_hints()
+        with self._session_lookup_hints_lock:
+            self._session_lookup_hints.clear()
+
+    def _lookup_full(self, token_len: int, block_hashes: Sequence[BlockHash]) -> int:
         """Check how many prefix tokens exist in the store.
 
         Checks across all TP ranks and PP ranks.
@@ -1446,6 +1558,27 @@ class MooncakeStoreWorker:
         )
         return hit_length
 
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        session_id: str | None = None,
+    ) -> int:
+        if not block_hashes or token_len <= 0:
+            return 0
+
+        hint_len = self._get_session_lookup_hint_len(
+            session_id,
+            token_len,
+            block_hashes,
+        )
+        if hint_len is not None:
+            hinted_hit = self._lookup_full(hint_len, block_hashes)
+            if hinted_hit == hint_len or hint_len == token_len:
+                return hinted_hit
+
+        return self._lookup_full(token_len, block_hashes)
+
     def get_kv_events(self) -> list[BlockStored]:
         if self.enable_kv_events and self.kv_send_thread is not None:
             return self.kv_send_thread.get_kv_events()
@@ -1513,7 +1646,14 @@ class LookupKeyServer:
                     hash_len = int.from_bytes(all_frames[2], byteorder="big")
                     blob = all_frames[3].buffer
                     block_hashes = BlobBlockHashes(blob, hash_len)
-                    result = self.store_worker.lookup(token_len, block_hashes)
+                    session_id = None
+                    if len(all_frames) > 4:
+                        session_id = bytes(all_frames[4]).decode() or None
+                    result = self.store_worker.lookup(
+                        token_len,
+                        block_hashes,
+                        session_id=session_id,
+                    )
                     self.socket.send(result.to_bytes(4, "big"))
 
                 elif msg_type == RESET_MSG:
@@ -1525,6 +1665,7 @@ class LookupKeyServer:
                         if self.store_worker.kv_send_thread is not None:
                             self.store_worker.kv_send_thread.request_queue.join()
                         self.store_worker.store.remove_all(force=True)
+                        self.store_worker.clear_session_lookup_hints()
                         logger.info("Mooncake store reset via remove_all succeeded.")
                         self.socket.send(RESP_OK)
                     except Exception as e:
@@ -1576,14 +1717,21 @@ class LookupKeyClient:
         )
         self.futures: dict[str, Future[int]] = {}
 
-    def _lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    def _lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        session_id: str | None,
+    ) -> int:
         hash_len = len(block_hashes[0]) if block_hashes else 0
-        all_frames = (
+        all_frames = [
             LOOKUP_MSG,
             token_len.to_bytes(4, byteorder="big"),
             hash_len.to_bytes(2, byteorder="big"),
             b"".join(block_hashes),
-        )
+        ]
+        if session_id is not None:
+            all_frames.append(session_id.encode())
         self.socket.send_multipart(all_frames, copy=False)
         resp = self.socket.recv()
         return int.from_bytes(resp, "big")
@@ -1593,13 +1741,19 @@ class LookupKeyClient:
         req_id: str,
         token_len: int,
         block_hashes: list[BlockHash],
+        session_id: str | None = None,
         non_block: bool = False,
     ) -> int | None:
         """If non_block is True, will return None until the result is ready,
         so the caller retries on a later step."""
         future = self.futures.get(req_id)
         if future is None:
-            future = self.executor.submit(self._lookup, token_len, list(block_hashes))
+            future = self.executor.submit(
+                self._lookup,
+                token_len,
+                list(block_hashes),
+                session_id,
+            )
             self.futures[req_id] = future
         if non_block and not future.done():
             return None

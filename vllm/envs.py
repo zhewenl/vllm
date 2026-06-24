@@ -201,6 +201,7 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
+    VLLM_MOONCAKE_SESSION_LOOKUP_HINTS: bool = False
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
     MOONCAKE_REQUESTER_LOCAL_HOSTNAME: str | None = None
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
@@ -1536,6 +1537,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO": lambda: float(
         os.getenv("VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO", "0.9")
     ),
+    # Use per-session store progress hints to start Mooncake lookup closer to
+    # the expected hit boundary.
+    "VLLM_MOONCAKE_SESSION_LOOKUP_HINTS": lambda: bool(
+        int(os.getenv("VLLM_MOONCAKE_SESSION_LOOKUP_HINTS", "0"))
+    ),
     # Pin this rank to a specific owner segment ("host:port").
     "MOONCAKE_PREFERRED_SEGMENT": lambda: os.getenv("MOONCAKE_PREFERRED_SEGMENT"),
     # Override the hostname the rank registers as a Mooncake requester.
@@ -2087,6 +2093,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        "VLLM_MOONCAKE_SESSION_LOOKUP_HINTS",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",

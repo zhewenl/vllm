@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
     rdma_utils,
 )
@@ -54,6 +55,7 @@ def _make_store_sending_thread(
     token_databases: list[ChunkedTokenDatabase] | None = None,
     block_size: int = 16,
     replicate_config: object | None = None,
+    record_session_hint: MagicMock | None = None,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
         coord = _default_send_coord()
@@ -62,6 +64,9 @@ def _make_store_sending_thread(
         db.set_kv_caches_base_addr([0x1000])
         db.set_block_len([256])
         token_databases = [db]
+    kwargs = {}
+    if record_session_hint is not None:
+        kwargs["record_session_hint"] = record_session_hint
     thread = mooncake_store_worker.KVCacheStoreSendingThread(
         store=store,
         token_databases=token_databases,
@@ -72,6 +77,7 @@ def _make_store_sending_thread(
         kv_role="kv_producer",
         ready_event=threading.Event(),
         replicate_config=replicate_config,
+        **kwargs,
     )
     thread.request_queue.task_done = MagicMock()
     return thread
@@ -138,6 +144,14 @@ def _make_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMeta:
         block_hashes=block_hashes,
         can_save=True,
     )
+
+
+def _set_session_lookup_hints(monkeypatch, enabled: bool) -> None:
+    if enabled:
+        monkeypatch.setenv("VLLM_MOONCAKE_SESSION_LOOKUP_HINTS", "1")
+    else:
+        monkeypatch.delenv("VLLM_MOONCAKE_SESSION_LOOKUP_HINTS", raising=False)
+    envs.disable_envs_cache()
 
 
 _DISK_OFFLOAD_SINGLE_KEY_BYTES = worker._estimate_disk_offload_staging_bytes([256])
@@ -389,6 +403,90 @@ def test_store_sending_thread_records_mooncake_metrics():
     assert len(stats.data["save_put"]) == 1
     assert stats.data["save_put"][0]["num_bytes"] == 512
     assert stats.data["save_put"][0]["status"] == "ok"
+
+
+def test_store_sending_thread_records_session_hint_after_successful_put(
+    monkeypatch,
+):
+    _set_session_lookup_hints(monkeypatch, True)
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    record_session_hint = MagicMock()
+    thread = _make_store_sending_thread(
+        store,
+        record_session_hint=record_session_hint,
+    )
+    req = _make_store_req("req-a", [b"a0", b"a1"])
+    req.session_id = "conv-abc"
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(req)
+
+    record_session_hint.assert_called_once_with("conv-abc", 32, [b"a0", b"a1"])
+
+
+def test_store_sending_thread_records_session_hint_when_keys_already_exist(
+    monkeypatch,
+):
+    _set_session_lookup_hints(monkeypatch, True)
+    store = MagicMock()
+    store.batch_is_exist.return_value = [1, 1]
+    record_session_hint = MagicMock()
+    thread = _make_store_sending_thread(
+        store,
+        record_session_hint=record_session_hint,
+    )
+    req = _make_store_req("req-a", [b"a0", b"a1"])
+    req.session_id = "conv-abc"
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(req)
+
+    store.batch_put_from_multi_buffers.assert_not_called()
+    record_session_hint.assert_called_once_with("conv-abc", 32, [b"a0", b"a1"])
+
+
+def test_store_sending_thread_does_not_record_session_hint_when_disabled(
+    monkeypatch,
+):
+    _set_session_lookup_hints(monkeypatch, False)
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    record_session_hint = MagicMock()
+    thread = _make_store_sending_thread(
+        store,
+        record_session_hint=record_session_hint,
+    )
+    req = _make_store_req("req-a", [b"a0", b"a1"])
+    req.session_id = "conv-abc"
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(req)
+
+    record_session_hint.assert_not_called()
+
+
+def test_store_sending_thread_does_not_record_session_hint_on_partial_put(
+    monkeypatch,
+):
+    _set_session_lookup_hints(monkeypatch, True)
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [-200, 256]
+    record_session_hint = MagicMock()
+    thread = _make_store_sending_thread(
+        store,
+        record_session_hint=record_session_hint,
+    )
+    req = _make_store_req("req-a", [b"a0", b"a1"])
+    req.session_id = "conv-abc"
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(req)
+
+    record_session_hint.assert_not_called()
 
 
 def test_store_sending_thread_only_skips_on_no_available_handle():
@@ -1367,6 +1465,80 @@ def test_lookup_checks_all_potential_swa_hit_boundaries():
         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:1@6837",
         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:1@683131",
     ]
+
+
+def test_lookup_uses_session_hint_length_when_enabled(monkeypatch):
+    _set_session_lookup_hints(monkeypatch, True)
+    worker = _make_bare_worker()
+    worker._record_session_lookup_hint("conv-abc", 32, [b"a0", b"a1"])
+    worker.store.batch_is_exist.return_value = [1, 1]
+
+    result = worker.lookup(
+        48,
+        [b"a0", b"a1", b"a2"],
+        session_id="conv-abc",
+    )
+
+    assert result == 32
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert len(keys) == 2
+    assert keys[-1].endswith("@6131")
+
+
+def test_lookup_ignores_session_hint_when_disabled(monkeypatch):
+    _set_session_lookup_hints(monkeypatch, True)
+    worker = _make_bare_worker()
+    worker._record_session_lookup_hint("conv-abc", 32, [b"a0", b"a1"])
+    _set_session_lookup_hints(monkeypatch, False)
+    worker.store.batch_is_exist.return_value = [1, 1, 1]
+
+    result = worker.lookup(
+        48,
+        [b"a0", b"a1", b"a2"],
+        session_id="conv-abc",
+    )
+
+    assert result == 48
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert len(keys) == 3
+
+
+def test_lookup_falls_back_when_session_hint_misses(monkeypatch):
+    _set_session_lookup_hints(monkeypatch, True)
+    worker = _make_bare_worker()
+    worker._record_session_lookup_hint("conv-abc", 32, [b"a0", b"a1"])
+    worker.store.batch_is_exist.side_effect = [
+        [1, 0],
+        [1, 1, 1],
+    ]
+
+    result = worker.lookup(
+        48,
+        [b"a0", b"a1", b"a2"],
+        session_id="conv-abc",
+    )
+
+    assert result == 48
+    assert [
+        len(call.args[0]) for call in worker.store.batch_is_exist.call_args_list
+    ] == [2, 3]
+
+
+def test_lookup_skips_stale_session_hint_anchor(monkeypatch):
+    _set_session_lookup_hints(monkeypatch, True)
+    worker = _make_bare_worker()
+    worker._record_session_lookup_hint("conv-abc", 32, [b"a0", b"a1"])
+    worker.store.batch_is_exist.return_value = [1, 1, 1]
+
+    result = worker.lookup(
+        48,
+        [b"a0", b"changed", b"a2"],
+        session_id="conv-abc",
+    )
+
+    assert result == 48
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert len(keys) == 3
 
 
 # ---------------------------------------------------------------------------

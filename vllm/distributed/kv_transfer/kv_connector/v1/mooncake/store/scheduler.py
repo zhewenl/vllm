@@ -7,6 +7,7 @@
 
 from typing import Any
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -96,10 +97,16 @@ class MooncakeStoreScheduler:
         if token_len < self._block_size:
             return 0, False
 
+        session_id = (
+            _session_id_from_request(request)
+            if envs.VLLM_MOONCAKE_SESSION_LOOKUP_HINTS
+            else None
+        )
         num_external_hit_tokens = self.client.lookup(
             request.request_id,
             token_len,
             request.block_hashes,
+            session_id=session_id,
             non_block=self.lookup_async,
         )
         if num_external_hit_tokens is None:

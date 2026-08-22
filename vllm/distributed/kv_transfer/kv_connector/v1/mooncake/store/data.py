@@ -16,6 +16,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorWorkerMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
+    derive_mamba_conv_split,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import is_non_overlapping_and_dense
@@ -23,6 +26,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashListWithBlockSize,
 )
+from vllm.v1.kv_cache_interface import MambaSpec
 
 logger = init_logger(__name__)
 
@@ -555,6 +559,107 @@ class LBNHCStoreLayout(TPShardedStoreLayout):
                     block_strides.append(block_stride)
                     sizes.append(self.heads_per_store_shard * content_bytes)
 
+        self._set_segment_templates(templates)
+
+
+class MambaStoreLayout(TPShardedStoreLayout):
+    """Store-TP shards containing complete Mamba state slices."""
+
+    store_format = "tp_shared_mamba"
+
+    def __init__(
+        self,
+        metadata: KeyMetadata,
+        block_size: int,
+        hash_block_size: int,
+        local_tp_size: int,
+        store_tp_size: int,
+        tp_rank: int,
+        spec: MambaSpec,
+    ) -> None:
+        super().__init__(
+            metadata,
+            block_size,
+            hash_block_size,
+            local_tp_size,
+            store_tp_size,
+            tp_rank,
+            num_kv_heads=store_tp_size,
+        )
+        self.spec = spec
+        self._segments = self._state_segments(spec, local_tp_size, self.shards_per_rank)
+
+    @staticmethod
+    def _state_segments(
+        spec: MambaSpec, local_tp_size: int, shards_per_rank: int
+    ) -> tuple[tuple[int, int], ...]:
+        conv = derive_mamba_conv_split(spec, local_tp_size)
+        if any(dim % shards_per_rank for dim in conv.local_proj_dims):
+            raise ValueError(
+                "Mamba conv projection dimensions must be divisible by the "
+                "number of Store shards per local rank"
+            )
+        segments = list(conv.local_conv_offsets)
+        state_offset = conv.ssm_sizes[0]
+        for state_index, shape in enumerate(spec.shapes[1:], start=1):
+            state_dtype: torch.dtype = spec.dtypes[state_index]
+            if shape[0] % shards_per_rank:
+                raise ValueError(
+                    "Mamba state leading dimension must be divisible by the "
+                    "number of Store shards per local rank"
+                )
+            state_bytes = (
+                torch.Size(shape).numel()
+                * torch.empty((), dtype=state_dtype).element_size()
+            )
+            segments.append((state_offset, state_bytes))
+            state_offset += state_bytes
+        if any(size % shards_per_rank for _, size in segments):
+            raise ValueError(
+                "Mamba state segment size must be divisible by the number of "
+                "Store shards per local rank"
+            )
+        return tuple(segments)
+
+    @classmethod
+    def is_compatible(
+        cls, spec: MambaSpec, local_tp_size: int, store_tp_size: int
+    ) -> bool:
+        try:
+            cls._state_segments(spec, local_tp_size, store_tp_size // local_tp_size)
+        except (AssertionError, IndexError, NotImplementedError, ValueError):
+            return False
+        return True
+
+    def register_kv_caches(
+        self,
+        kv_caches: Sequence[torch.Tensor],
+        num_blocks: int,
+    ) -> None:
+        templates: list[tuple[list[int], list[int], list[int]]] = [
+            ([], [], []) for _ in range(self.shards_per_rank)
+        ]
+        for cache in kv_caches:
+            if cache.ndim != 4 or tuple(cache.shape[:3]) != (num_blocks, 1, 1):
+                raise ValueError(
+                    "TP-shared Mamba store requires logical cache shape "
+                    "(num_blocks, 1, 1, state_bytes)"
+                )
+            element_size = cache.element_size()
+            if cache.stride(3) * element_size != 1:
+                raise ValueError("TP-shared Mamba store requires packed state bytes")
+            block_stride = cache.stride(0) * element_size
+            content_bytes = cache.shape[3] * element_size
+            if content_bytes < self.spec.state_content_size_bytes:
+                raise ValueError("Mamba cache does not contain the complete state")
+            for shard_index, (addr_bases, block_strides, sizes) in enumerate(templates):
+                for offset, local_size in self._segments:
+                    shard_size = local_size // self.shards_per_rank
+                    addr_bases.append(
+                        cache.data_ptr() + offset + shard_index * shard_size
+                    )
+                    block_strides.append(block_stride)
+                    sizes.append(shard_size)
         self._set_segment_templates(templates)
 
 

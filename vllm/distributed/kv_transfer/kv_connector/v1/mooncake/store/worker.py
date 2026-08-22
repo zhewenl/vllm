@@ -47,10 +47,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
+    MambaStoreLayout,
     MooncakeStoreConnectorMetadata,
     MooncakeStoreWorkerMetadata,
     PoolKey,
     ReqMeta,
+    StoreLayout,
     StoreShardId,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
@@ -744,18 +746,26 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         block_idx,
                     )
                     continue
-                addr, size = db.prepare_value_for_block(block_id)
-                key = db.key_for(key_hash)
-                keys.append(key)
-                addrs.append(addr)
-                sizes.append(size)
-                if group_ids is not None:
-                    group_ids.append(
-                        _make_mooncake_group_id(
-                            db.metadata,
-                            key.rsplit("@", 1)[-1],
+                shard_ids = db.store_layout.local_shard_ids
+                block_addrs, block_sizes, _ = db.store_layout.prepare_values(
+                    [(0, db.block_size)] * len(shard_ids),
+                    [block_id],
+                    shard_ids,
+                )
+                for shard_id, addr, size in zip(
+                    shard_ids, block_addrs, block_sizes, strict=True
+                ):
+                    key = db.store_layout.key_for(shard_id, key_hash)
+                    keys.append(key)
+                    addrs.append(addr)
+                    sizes.append(size)
+                    if group_ids is not None:
+                        group_ids.append(
+                            _make_mooncake_group_id(
+                                db.metadata,
+                                key.rsplit("@", 1)[-1],
+                            )
                         )
-                    )
 
         if not keys:
             return True
@@ -892,10 +902,17 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             # Within each lcm region only per-spec relevant chunks are loaded
             # (e.g., SWA or linear attn), so mask out irrelevant chunks
+            replay_boundary = req_meta.num_prompt_tokens
+            if (
+                self.kv_role == "kv_consumer"
+                and replay_boundary is not None
+                and token_len > replay_boundary
+            ):
+                replay_boundary = token_len + 1
             store_masks = self.coord.store_mask(
                 token_len,
                 save_start,
-                num_prompt_tokens=req_meta.num_prompt_tokens,
+                num_prompt_tokens=replay_boundary,
             )
 
             starts: list[int] = []
@@ -1603,12 +1620,20 @@ class MooncakeStoreWorker:
                 KVCacheLayout.LBHNC: LBHNCStoreLayout,
                 KVCacheLayout.LBNHC: LBNHCStoreLayout,
             }.get(cache_layout)
+        group_specs = [group.kv_cache_spec for group in self._kv_cache_groups]
+        full_attention_specs = [
+            spec for spec in group_specs if type(spec) is FullAttentionSpec
+        ]
+        mamba_specs = [spec for spec in group_specs if type(spec) is MambaSpec]
+        supported_group_types = len(full_attention_specs) + len(mamba_specs) == len(
+            group_specs
+        )
         share_tp_topology = (
             store_layout_cls is not None
             and self.pcp_size == 1
             and self.dcp_size == 1
-            and len(self._kv_cache_groups) == 1
-            and type(self._kv_cache_groups[0].kv_cache_spec) is FullAttentionSpec
+            and supported_group_types
+            and len(full_attention_specs) == 1
             and str(extra_config.get("enable_cross_layers_blocks", "False")).lower()
             != "true"
         )
@@ -1622,15 +1647,35 @@ class MooncakeStoreWorker:
         share_replicated_mqa = False
         if valid_tp_mapping:
             assert requested_store_tp_size is not None
-            share_tp_layout = self.num_kv_head % requested_store_tp_size == 0
-            share_replicated_mqa = self.num_kv_head == 1
+            attention_layout_supported = (
+                self.num_kv_head == 1 or self.num_kv_head % requested_store_tp_size == 0
+            )
+            mamba_layouts_supported = all(
+                MambaStoreLayout.is_compatible(
+                    spec, self.tp_size, requested_store_tp_size
+                )
+                for spec in mamba_specs
+            )
+            replicated_mqa_only = not mamba_specs and self.num_kv_head == 1
+            share_tp_layout = (
+                attention_layout_supported
+                and mamba_layouts_supported
+                and not replicated_mqa_only
+            )
+            share_replicated_mqa = attention_layout_supported and replicated_mqa_only
         self.store_tp_size = requested_store_tp_size if share_tp_layout else None
         store_namespace = ""
         if share_tp_layout:
             assert store_layout_cls is not None
             assert requested_store_tp_size is not None
-            store_namespace = store_layout_cls.shared_namespace(
-                requested_store_tp_size, self.pp_size
+            store_format = (
+                f"tp_shared_hybrid_{cache_layout.name.lower()}"
+                if mamba_specs
+                else store_layout_cls.store_format
+            )
+            store_namespace = (
+                f"@store_tp:{requested_store_tp_size}@store_pp:{self.pp_size}"
+                f"@store_format:{store_format}"
             )
         elif share_replicated_mqa:
             store_namespace = f"@store_pp:{self.pp_size}@store_format:tp_shared_mqa"
@@ -1675,24 +1720,43 @@ class MooncakeStoreWorker:
         )
         if self.store_tp_size is not None:
             assert store_layout_cls is not None
-            group = self._kv_cache_groups[0]
-            group_metadata = dataclasses.replace(metadata, group_id=0)
-            self.token_dbs = [
-                ChunkedTokenDatabase(
-                    group_metadata,
-                    group.kv_cache_spec.block_size,
-                    hash_block_size=self.hash_block_size,
-                    store_layout=store_layout_cls(
+            self.token_dbs = []
+            for g_idx, group in enumerate(self._kv_cache_groups):
+                spec = group.kv_cache_spec
+                group_metadata = dataclasses.replace(metadata, group_id=g_idx)
+                store_layout: StoreLayout | None
+                if type(spec) is FullAttentionSpec and self.num_kv_head == 1:
+                    group_metadata = dataclasses.replace(group_metadata, tp_rank=0)
+                    store_layout = None
+                elif type(spec) is FullAttentionSpec:
+                    store_layout = store_layout_cls(
                         group_metadata,
-                        group.kv_cache_spec.block_size,
+                        spec.block_size,
                         self.hash_block_size,
                         local_tp_size=self.tp_size,
                         store_tp_size=self.store_tp_size,
                         tp_rank=self.tp_rank,
                         num_kv_heads=self.num_kv_head,
-                    ),
+                    )
+                else:
+                    assert type(spec) is MambaSpec
+                    store_layout = MambaStoreLayout(
+                        group_metadata,
+                        spec.block_size,
+                        self.hash_block_size,
+                        local_tp_size=self.tp_size,
+                        store_tp_size=self.store_tp_size,
+                        tp_rank=self.tp_rank,
+                        spec=spec,
+                    )
+                self.token_dbs.append(
+                    ChunkedTokenDatabase(
+                        group_metadata,
+                        spec.block_size,
+                        hash_block_size=self.hash_block_size,
+                        store_layout=store_layout,
+                    )
                 )
-            ]
         else:
             self.token_dbs = [
                 ChunkedTokenDatabase(
@@ -1780,10 +1844,12 @@ class MooncakeStoreWorker:
 
         seen_storage_ptrs: set[int] = set()
         cache_tensors: list[torch.Tensor] = []
+        cache_by_layer: dict[str, torch.Tensor] = {}
 
-        for cache in kv_caches.values():
+        for layer_name, cache in kv_caches.items():
             cache = group_kernel_blocks(cache, self.num_blocks)
             cache_tensors.append(cache)
+            cache_by_layer[layer_name] = cache
             cache_storage = cache.untyped_storage()
             base_addr = cache_storage.data_ptr()
             region_len = cache_storage.nbytes()
@@ -1806,8 +1872,24 @@ class MooncakeStoreWorker:
             self.num_blocks,
         )
 
-        for db in self.token_dbs:
-            db.store_layout.register_kv_caches(cache_tensors, self.num_blocks)
+        group_cache_tensors = [
+            [cache_by_layer[name] for name in group.layer_names if name in cache_by_layer]
+            for group in self._kv_cache_groups
+        ]
+        for group_id, db in enumerate(self.token_dbs):
+            group = self._kv_cache_groups[group_id]
+            if self.store_tp_size is not None and len(
+                group_cache_tensors[group_id]
+            ) != len(group.layer_names):
+                raise ValueError(
+                    f"Missing KV cache tensors for TP-shared cache group {group_id}"
+                )
+            db.store_layout.register_kv_caches(
+                group_cache_tensors[group_id]
+                if self.store_tp_size is not None
+                else cache_tensors,
+                self.num_blocks,
+            )
 
         # Start transfer threads
         if self.can_put:

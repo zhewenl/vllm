@@ -55,6 +55,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     MooncakeStoreConnectorMetadata,
     MooncakeStoreWorkerMetadata,
     PoolKey,
+    RankLocalStoreLayout,
     ReqMeta,
     StoreLayout,
     StoreShardId,
@@ -1705,11 +1706,10 @@ class MooncakeStoreWorker:
                 else extra_config.get("store_tp_size")
             )
             logger.warning(
-                "Mooncake heterogeneous-TP store sharing is disabled for "
-                "Store TP configuration %r with KV layout %s; using a "
-                "compatibility-namespaced rank-local store layout",
+                "Store TP configuration %r with KV layout %s uses namespace %s",
                 requested_topology,
                 cache_layout,
+                store_namespace,
             )
         metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],
@@ -1733,10 +1733,12 @@ class MooncakeStoreWorker:
             for g_idx, group in enumerate(self._kv_cache_groups):
                 spec = group.kv_cache_spec
                 group_metadata = dataclasses.replace(metadata, group_id=g_idx)
-                store_layout: StoreLayout | None
+                store_layout: StoreLayout
                 if type(spec) is FullAttentionSpec and self.num_kv_head == 1:
                     group_metadata = dataclasses.replace(group_metadata, tp_rank=0)
-                    store_layout = None
+                    store_layout = RankLocalStoreLayout(
+                        group_metadata, spec.block_size, self.hash_block_size
+                    )
                 elif type(spec) is FullAttentionSpec:
                     store_layout = store_layout_cls(
                         group_metadata,

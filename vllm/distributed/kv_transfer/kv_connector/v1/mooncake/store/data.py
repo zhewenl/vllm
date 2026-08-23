@@ -355,15 +355,6 @@ class RankLocalStoreLayout(StoreLayout):
 class TPShardedStoreLayout(StoreLayout):
     """Store layout shared by divisible TP sizes."""
 
-    store_format: str
-
-    @classmethod
-    def shared_namespace(cls, store_tp_size: int, pp_size: int) -> str:
-        return (
-            f"@store_tp:{store_tp_size}@store_pp:{pp_size}"
-            f"@store_format:{cls.store_format}"
-        )
-
     def __init__(
         self,
         metadata: KeyMetadata,
@@ -467,6 +458,8 @@ class TPShardedStoreLayout(StoreLayout):
 
 
 class AttentionStoreLayout(TPShardedStoreLayout):
+    store_format: str
+
     def __init__(
         self,
         metadata: KeyMetadata,
@@ -488,9 +481,34 @@ class AttentionStoreLayout(TPShardedStoreLayout):
         self.heads_per_store_shard = num_kv_heads // store_tp_size
         self.local_num_kv_heads = num_kv_heads // local_tp_size
 
+    def _cache_strides(
+        self, cache: torch.Tensor, num_blocks: int
+    ) -> tuple[int, int, int, int]:
+        if cache.ndim != 4 or tuple(cache.shape[:3]) != (
+            num_blocks,
+            self.local_num_kv_heads,
+            self.block_size,
+        ):
+            raise ValueError(
+                "TP-shared Mooncake store requires packed KV caches with "
+                "logical shape (num_blocks, local_kv_heads, block_size, content)"
+            )
+        element_size = cache.element_size()
+        block_stride, head_stride, token_stride, content_stride = (
+            stride * element_size for stride in cache.stride()
+        )
+        if content_stride != element_size:
+            raise ValueError("TP-shared Mooncake store requires packed KV content")
+        return (
+            block_stride,
+            head_stride,
+            token_stride,
+            cache.shape[3] * element_size,
+        )
+
 
 class LBHNCStoreLayout(AttentionStoreLayout):
-    """Native head-major layout shared by divisible TP sizes."""
+    """Direct Store descriptors for LBHNC KV caches."""
 
     store_format = "tp_shared_lbhnc"
 
@@ -503,24 +521,14 @@ class LBHNCStoreLayout(AttentionStoreLayout):
             ([], [], []) for _ in range(self.shards_per_rank)
         ]
         for cache in kv_caches:
-            if cache.ndim != 4 or tuple(cache.shape[:3]) != (
-                num_blocks,
-                self.local_num_kv_heads,
-                self.block_size,
-            ):
-                raise ValueError(
-                    "TP-shared Mooncake store requires packed KV caches with "
-                    "logical shape (num_blocks, local_kv_heads, block_size, content)"
-                )
-
-            element_size = cache.element_size()
-            block_stride, head_stride, token_stride, content_stride = (
-                stride * element_size for stride in cache.stride()
-            )
-            content_bytes = cache.shape[3] * element_size
+            (
+                block_stride,
+                head_stride,
+                token_stride,
+                content_bytes,
+            ) = self._cache_strides(cache, num_blocks)
             if not (
-                content_stride == element_size
-                and token_stride == content_bytes
+                token_stride == content_bytes
                 and head_stride == self.block_size * content_bytes
             ):
                 raise ValueError(
@@ -537,13 +545,13 @@ class LBHNCStoreLayout(AttentionStoreLayout):
 
 
 class BLHNCStoreLayout(LBHNCStoreLayout):
-    """Block-outermost head-major layout."""
+    """Direct Store descriptors for BLHNC KV caches."""
 
     store_format = "tp_shared_blhnc"
 
 
 class LBNHCStoreLayout(AttentionStoreLayout):
-    """Native token-major layout shared by divisible TP sizes."""
+    """Direct Store descriptors for LBNHC KV caches."""
 
     store_format = "tp_shared_lbnhc"
 
@@ -556,24 +564,14 @@ class LBNHCStoreLayout(AttentionStoreLayout):
             ([], [], []) for _ in range(self.shards_per_rank)
         ]
         for cache in kv_caches:
-            if cache.ndim != 4 or tuple(cache.shape[:3]) != (
-                num_blocks,
-                self.local_num_kv_heads,
-                self.block_size,
-            ):
-                raise ValueError(
-                    "TP-shared Mooncake store requires packed KV caches with "
-                    "logical shape (num_blocks, local_kv_heads, block_size, content)"
-                )
-
-            element_size = cache.element_size()
-            block_stride, head_stride, token_stride, content_stride = (
-                stride * element_size for stride in cache.stride()
-            )
-            content_bytes = cache.shape[3] * element_size
+            (
+                block_stride,
+                head_stride,
+                token_stride,
+                content_bytes,
+            ) = self._cache_strides(cache, num_blocks)
             if not (
-                content_stride == element_size
-                and head_stride == content_bytes
+                head_stride == content_bytes
                 and token_stride == self.local_num_kv_heads * content_bytes
             ):
                 raise ValueError(
@@ -595,13 +593,13 @@ class LBNHCStoreLayout(AttentionStoreLayout):
 
 
 class BLNHCStoreLayout(LBNHCStoreLayout):
-    """Block-outermost token-major layout."""
+    """Direct Store descriptors for BLNHC KV caches."""
 
     store_format = "tp_shared_blnhc"
 
 
 class LHBNCStoreLayout(AttentionStoreLayout):
-    """Head-outermost layout using one segment per local KV head."""
+    """Direct Store descriptors for LHBNC KV caches."""
 
     store_format = "tp_shared_lhbnc"
 
@@ -614,25 +612,15 @@ class LHBNCStoreLayout(AttentionStoreLayout):
             ([], [], []) for _ in range(self.shards_per_rank)
         ]
         for cache in kv_caches:
-            if cache.ndim != 4 or tuple(cache.shape[:3]) != (
-                num_blocks,
-                self.local_num_kv_heads,
-                self.block_size,
-            ):
-                raise ValueError(
-                    "TP-shared Mooncake store requires packed KV caches with "
-                    "logical shape (num_blocks, local_kv_heads, block_size, content)"
-                )
-
-            element_size = cache.element_size()
-            block_stride, head_stride, token_stride, content_stride = (
-                stride * element_size for stride in cache.stride()
-            )
-            content_bytes = cache.shape[3] * element_size
+            (
+                block_stride,
+                head_stride,
+                token_stride,
+                content_bytes,
+            ) = self._cache_strides(cache, num_blocks)
             head_bytes = self.block_size * content_bytes
             if not (
-                content_stride == element_size
-                and token_stride == content_bytes
+                token_stride == content_bytes
                 and block_stride >= head_bytes
                 and head_stride >= head_bytes
             ):
@@ -654,15 +642,16 @@ class LHBNCStoreLayout(AttentionStoreLayout):
 
 
 class BHLNCStoreLayout(LHBNCStoreLayout):
-    """Block-outermost head/layer-interleaved layout."""
+    """Direct Store descriptors for BHLNC KV caches."""
 
     store_format = "tp_shared_bhlnc"
 
 
 class MambaStoreLayout(TPShardedStoreLayout):
-    """Store-TP shards containing complete Mamba state slices."""
+    """Store descriptors for cache groups represented by ``MambaSpec``.
 
-    store_format = "tp_shared_mamba"
+    This includes Mamba and GDN convolution/recurrent state caches.
+    """
 
     def __init__(
         self,
@@ -701,7 +690,7 @@ class MambaStoreLayout(TPShardedStoreLayout):
             state_dtype: torch.dtype = spec.dtypes[state_index]
             if shape[0] % shards_per_rank:
                 raise ValueError(
-                    "Mamba state leading dimension must be divisible by the "
+                    "State leading dimension must be divisible by the "
                     "number of Store shards per local rank"
                 )
             state_bytes = (
@@ -712,7 +701,7 @@ class MambaStoreLayout(TPShardedStoreLayout):
             state_offset += state_bytes
         if any(size % shards_per_rank for _, size in segments):
             raise ValueError(
-                "Mamba state segment size must be divisible by the number of "
+                "State segment size must be divisible by the number of "
                 "Store shards per local rank"
             )
         return tuple(segments)
@@ -738,16 +727,18 @@ class MambaStoreLayout(TPShardedStoreLayout):
         for cache in kv_caches:
             if cache.ndim != 4 or tuple(cache.shape[:3]) != (num_blocks, 1, 1):
                 raise ValueError(
-                    "TP-shared Mamba store requires logical cache shape "
+                    "TP-shared MambaSpec store requires logical cache shape "
                     "(num_blocks, 1, 1, state_bytes)"
                 )
             element_size = cache.element_size()
             if cache.stride(3) * element_size != 1:
-                raise ValueError("TP-shared Mamba store requires packed state bytes")
+                raise ValueError(
+                    "TP-shared MambaSpec store requires packed state bytes"
+                )
             block_stride = cache.stride(0) * element_size
             content_bytes = cache.shape[3] * element_size
             if content_bytes < self.spec.state_content_size_bytes:
-                raise ValueError("Mamba cache does not contain the complete state")
+                raise ValueError("MambaSpec cache does not contain the complete state")
             for shard_index, (addr_bases, block_strides, sizes) in enumerate(templates):
                 for offset, local_size in self._segments:
                     shard_size = local_size // self.shards_per_rank

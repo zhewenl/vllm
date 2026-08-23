@@ -205,24 +205,6 @@ def test_rank_local_descriptors_handle_empty_and_invalid_chunks():
         layout.prepare_values([(0, BLOCK_SIZE + 1)], [0, 1], [0])
 
 
-@pytest.mark.parametrize(
-    ("layout_cls", "store_format"),
-    [
-        (LBHNCStoreLayout, "tp_shared_lbhnc"),
-        (LBNHCStoreLayout, "tp_shared_lbnhc"),
-        (BLHNCStoreLayout, "tp_shared_blhnc"),
-        (BLNHCStoreLayout, "tp_shared_blnhc"),
-        (LHBNCStoreLayout, "tp_shared_lhbnc"),
-        (BHLNCStoreLayout, "tp_shared_bhlnc"),
-    ],
-)
-def test_tp_shared_layout_owns_store_namespace(layout_cls, store_format):
-    assert (
-        layout_cls.shared_namespace(4, 2)
-        == f"@store_tp:4@store_pp:2@store_format:{store_format}"
-    )
-
-
 def test_rank_local_database_api_rejects_tp_shared_layout():
     metadata = KeyMetadata("test-model", 0, 0, 0, 0)
     layout = LBHNCStoreLayout(

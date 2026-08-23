@@ -930,6 +930,26 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
     assert tracker.has_pending_offload is True
 
 
+def test_consumer_emits_partial_tail_for_store_writeback():
+    scheduler = _make_bare_scheduler(
+        hash_block_size=4,
+        enable_partial_hash_hits=True,
+        kv_role="kv_consumer",
+        save_decode_cache=True,
+    )
+    out = _add_pending_partial_tail_request(
+        scheduler,
+        num_tokens=12,
+        block_hashes=[b"h0", b"h1", b"h2"],
+        block_ids=([0],),
+    )
+
+    meta = scheduler.build_connector_meta(out)
+
+    assert len(meta.requests) == 1
+    assert meta.requests[0].partial_tail_offloads == [(1, 7, 12)]
+
+
 def test_resumed_partial_tail_uses_handoff_boundary():
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
     # Resumption replays prompt + previously generated tokens.

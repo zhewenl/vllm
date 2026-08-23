@@ -13,11 +13,132 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
+    MambaStoreLayout,
     RankLocalStoreLayout,
 )
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.kv_cache_utils import BlockHash
 
 BLOCK_SIZE = 128
+
+
+def _make_gdn_store_layout(
+    *, local_tp_size: int, tp_rank: int
+) -> tuple[MambaStoreLayout, torch.Tensor]:
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    local_factor = 4 // local_tp_size
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((6 * local_factor, 3), (local_factor, 2, 2)),
+        dtypes=(torch.uint8, torch.uint8),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    tensor = torch.empty((2, 1, 1, spec.state_content_size_bytes), dtype=torch.uint8)
+    metadata = KeyMetadata(
+        "test-model",
+        tp_rank,
+        0,
+        0,
+        0,
+        group_id=1,
+        store_namespace="@store_tp:4@store_pp:1@store_format:tp_shared_hybrid_lbhnc",
+    )
+    layout = MambaStoreLayout(
+        metadata,
+        block_size=16,
+        hash_block_size=16,
+        local_tp_size=local_tp_size,
+        store_tp_size=4,
+        tp_rank=tp_rank,
+        spec=spec,
+    )
+    layout.register_kv_caches([tensor], 2)
+    return layout, tensor
+
+
+def _descriptors_for_block(
+    layout: MambaStoreLayout, shard_id: int
+) -> tuple[list[int], list[int]]:
+    addrs, sizes, _ = layout.prepare_values([(0, layout.block_size)], [0], [shard_id])
+    return addrs[0], sizes[0]
+
+
+def _read_segments(addrs: list[int], sizes: list[int]) -> bytes:
+    return b"".join(
+        ctypes.string_at(addr, size) for addr, size in zip(addrs, sizes, strict=True)
+    )
+
+
+def test_tp_shared_layout_loads_partial_prefix_from_physical_block():
+    metadata = KeyMetadata("test-model", 0, 0, 0, 0)
+    layout = LBHNCStoreLayout(
+        metadata,
+        16,
+        16,
+        local_tp_size=2,
+        store_tp_size=4,
+        tp_rank=0,
+        num_kv_heads=8,
+    )
+    tensor = torch.empty((2, 4, 16, 4), dtype=torch.float16)
+    layout.register_kv_caches([tensor], 2)
+    shard_ids = layout.local_shard_ids
+
+    addrs, sizes, block_ids = layout.prepare_values(
+        [(0, 8)] * len(shard_ids), [1], shard_ids
+    )
+
+    assert len(addrs) == len(sizes) == len(shard_ids)
+    assert block_ids == [1] * len(shard_ids)
+
+
+@pytest.mark.parametrize(("producer_tp", "consumer_tp"), [(4, 2), (2, 4)])
+def test_gdn_store_shards_round_trip_in_both_tp_directions(
+    monkeypatch, producer_tp: int, consumer_tp: int
+):
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+    block_hash = BlockHash(b"h")
+    stored: dict[int, bytes] = {}
+    keys: dict[int, str] = {}
+    for tp_rank in range(producer_tp):
+        layout, cache = _make_gdn_store_layout(
+            local_tp_size=producer_tp, tp_rank=tp_rank
+        )
+        cache.copy_(torch.arange(cache.numel(), dtype=torch.uint8).view_as(cache))
+        cache.add_(tp_rank * 32)
+        for shard_id in layout.local_shard_ids:
+            addrs, sizes = _descriptors_for_block(layout, shard_id)
+            stored[shard_id] = _read_segments(addrs, sizes)
+            keys[shard_id] = layout.key_for(shard_id, block_hash)
+
+    assert set(stored) == set(range(4))
+    for tp_rank in range(consumer_tp):
+        layout, cache = _make_gdn_store_layout(
+            local_tp_size=consumer_tp, tp_rank=tp_rank
+        )
+        cache.zero_()
+        for shard_id in layout.local_shard_ids:
+            assert layout.key_for(shard_id, block_hash) == keys[shard_id]
+            addrs, sizes = _descriptors_for_block(layout, shard_id)
+            offset = 0
+            for addr, size in zip(addrs, sizes, strict=True):
+                ctypes.memmove(addr, stored[shard_id][offset : offset + size], size)
+                offset += size
+            assert _read_segments(addrs, sizes) == stored[shard_id]
+
+
+def test_gdn_store_shard_segments_preserve_projection_boundaries(monkeypatch):
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+    layout, cache = _make_gdn_store_layout(local_tp_size=2, tp_rank=0)
+
+    shard0_addrs, sizes = _descriptors_for_block(layout, 0)
+    shard1_addrs, shard1_sizes = _descriptors_for_block(layout, 1)
+
+    assert sizes == shard1_sizes == [6, 6, 6, 4]
+    assert [addr - cache.data_ptr() for addr in shard0_addrs] == [0, 12, 24, 36]
+    assert [addr - cache.data_ptr() for addr in shard1_addrs] == [6, 18, 30, 40]
 
 
 def _rank_local_layout(num_regions: int, num_block_lens: int) -> RankLocalStoreLayout:

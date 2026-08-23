@@ -1668,6 +1668,7 @@ class MooncakeStoreWorker:
         if share_tp_layout:
             assert store_layout_cls is not None
             assert requested_store_tp_size is not None
+            assert cache_layout is not None
             store_format = (
                 f"tp_shared_hybrid_{cache_layout.name.lower()}"
                 if mamba_specs
@@ -1873,7 +1874,11 @@ class MooncakeStoreWorker:
         )
 
         group_cache_tensors = [
-            [cache_by_layer[name] for name in group.layer_names if name in cache_by_layer]
+            [
+                cache_by_layer[name]
+                for name in group.layer_names
+                if name in cache_by_layer
+            ]
             for group in self._kv_cache_groups
         ]
         for group_id, db in enumerate(self.token_dbs):

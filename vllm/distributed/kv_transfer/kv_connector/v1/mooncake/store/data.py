@@ -440,8 +440,14 @@ class TPShardedStoreLayout(StoreLayout):
             (chunk[0] for chunk in chunks), dtype=np.int64, count=count
         )
         ends = np.fromiter((chunk[1] for chunk in chunks), dtype=np.int64, count=count)
-        if np.any(ends - starts != self.block_size):
-            raise ValueError("TP-shared Mooncake store requires full KV blocks")
+        spans = ends - starts
+        if np.any(starts % self.block_size != 0) or np.any(
+            (spans <= 0) | (spans > self.block_size)
+        ):
+            raise ValueError(
+                "TP-shared Mooncake store chunks must start at a block "
+                "boundary and span at most one block"
+            )
 
         first_shard = self.store_shard_ids[0]
         local_shards = np.fromiter(

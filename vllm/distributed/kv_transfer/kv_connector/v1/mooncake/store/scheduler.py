@@ -379,7 +379,7 @@ class MooncakeStoreScheduler:
         # emit an offload-only ReqMeta (token_len_chunk=0 skips the normal
         # save; can_save=True takes the normal enqueue path).
         step_partial_tails = getattr(scheduler_output, "partial_tail_offloads", None)
-        if step_partial_tails and not is_consumer:
+        if step_partial_tails and can_process_cached:
             pending = dict(step_partial_tails)
             for req_meta in meta.requests:
                 if req_meta.can_save:

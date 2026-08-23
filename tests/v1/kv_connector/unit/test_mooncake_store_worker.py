@@ -28,11 +28,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     worker as mooncake_store_worker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    BHLNCStoreLayout,
+    BLHNCStoreLayout,
+    BLNHCStoreLayout,
     BlobBlockHashes,
     ChunkedTokenDatabase,
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
+    LHBNCStoreLayout,
     LoadSpec,
     MambaStoreLayout,
     PoolKey,
@@ -51,7 +55,14 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 _TP_SHARED_NAMESPACE = "@store_tp:4@store_pp:1@store_format:tp_shared_lbhnc"
-_TP_SHARED_LBNHC_NAMESPACE = "@store_tp:4@store_pp:1@store_format:tp_shared_lbnhc"
+_STORE_LAYOUT_CASES = [
+    (KVCacheLayout.LBHNC, LBHNCStoreLayout, "tp_shared_lbhnc"),
+    (KVCacheLayout.LBNHC, LBNHCStoreLayout, "tp_shared_lbnhc"),
+    (KVCacheLayout.BLHNC, BLHNCStoreLayout, "tp_shared_blhnc"),
+    (KVCacheLayout.BLNHC, BLNHCStoreLayout, "tp_shared_blnhc"),
+    (KVCacheLayout.LHBNC, LHBNCStoreLayout, "tp_shared_lhbnc"),
+    (KVCacheLayout.BHLNC, BHLNCStoreLayout, "tp_shared_bhlnc"),
+]
 
 
 def _tp_shared_prefix(tp_rank: int) -> str:
@@ -1993,7 +2004,12 @@ def test_requester_worker_init_skips_disk_budget_when_offload_disabled(
     assert w.disk_offload_buffer_budget_bytes is None
 
 
-def test_worker_enables_lbhnc_store_tp_layout(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("cache_layout", "layout_cls", "store_format"), _STORE_LAYOUT_CASES
+)
+def test_worker_enables_store_tp_layout(
+    tmp_path, monkeypatch, cache_layout, layout_cls, store_format
+):
     store = MagicMock()
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
@@ -2012,13 +2028,17 @@ def test_worker_enables_lbhnc_store_tp_layout(tmp_path, monkeypatch):
     )
 
     w = worker.MooncakeStoreWorker(
-        _make_vllm_config(extra_config={"store_tp_size": 4}),
+        _make_vllm_config(
+            extra_config={"store_tp_size": 4}, kv_cache_layout=cache_layout
+        ),
         _make_kv_cache_config(),
     )
 
     assert w.store_tp_size == 4
-    assert w.token_dbs[0].metadata.store_namespace == _TP_SHARED_NAMESPACE
-    assert isinstance(w.token_dbs[0].store_layout, LBHNCStoreLayout)
+    assert w.token_dbs[0].metadata.store_namespace == (
+        f"@store_tp:4@store_pp:1@store_format:{store_format}"
+    )
+    assert isinstance(w.token_dbs[0].store_layout, layout_cls)
     assert w.token_dbs[0].store_layout.local_shard_ids == (0, 1)
     assert len(w._lookup_key_prefixes[0]) == 4
 
@@ -2100,39 +2120,6 @@ def test_hybrid_gdn_falls_back_when_state_cannot_be_store_sharded(
     assert "@store_format:rank_local_tp2" in store_worker.token_dbs[0].key_for(
         BlockHash(b"h")
     )
-
-
-def test_worker_enables_lbnhc_store_tp_layout(tmp_path, monkeypatch):
-    store = MagicMock()
-    store.setup.return_value = 0
-    _install_fake_mooncake(monkeypatch, store)
-    _patch_worker_runtime(monkeypatch, tp_size=2)
-    monkeypatch.setattr(_FakeModelConfig, "get_total_num_kv_heads", lambda _self: 8)
-    monkeypatch.setenv(
-        "MOONCAKE_CONFIG_PATH",
-        _write_mooncake_config(
-            tmp_path,
-            {
-                "metadata_server": "http://metadata/endpoint",
-                "protocol": "tcp",
-                "master_server_address": "10.0.0.7:50051",
-            },
-        ),
-    )
-
-    w = worker.MooncakeStoreWorker(
-        _make_vllm_config(
-            extra_config={"store_tp_size": 4},
-            kv_cache_layout=KVCacheLayout.LBNHC,
-        ),
-        _make_kv_cache_config(),
-    )
-
-    assert w.store_tp_size == 4
-    assert w.token_dbs[0].metadata.store_namespace == _TP_SHARED_LBNHC_NAMESPACE
-    assert isinstance(w.token_dbs[0].store_layout, LBNHCStoreLayout)
-    assert w.token_dbs[0].store_layout.local_shard_ids == (0, 1)
-    assert len(w._lookup_key_prefixes[0]) == 4
 
 
 @pytest.mark.parametrize(

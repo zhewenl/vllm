@@ -42,11 +42,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
     MooncakeStoreCoordinator,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
+    BHLNCStoreLayout,
+    BLHNCStoreLayout,
+    BLNHCStoreLayout,
     BlobBlockHashes,
     ChunkedTokenDatabase,
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
+    LHBNCStoreLayout,
     MambaStoreLayout,
     MooncakeStoreConnectorMetadata,
     MooncakeStoreWorkerMetadata,
@@ -1619,6 +1623,10 @@ class MooncakeStoreWorker:
             store_layout_cls = {
                 KVCacheLayout.LBHNC: LBHNCStoreLayout,
                 KVCacheLayout.LBNHC: LBNHCStoreLayout,
+                KVCacheLayout.BLHNC: BLHNCStoreLayout,
+                KVCacheLayout.BLNHC: BLNHCStoreLayout,
+                KVCacheLayout.LHBNC: LHBNCStoreLayout,
+                KVCacheLayout.BHLNC: BHLNCStoreLayout,
             }.get(cache_layout)
         group_specs = [group.kv_cache_spec for group in self._kv_cache_groups]
         full_attention_specs = [

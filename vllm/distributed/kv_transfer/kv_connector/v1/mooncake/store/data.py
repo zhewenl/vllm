@@ -227,7 +227,7 @@ class StoreLayout:
 
 
 class RankLocalStoreLayout(StoreLayout):
-    """Historical rank-local Store payload layout."""
+    """Rank-local Store payload layout."""
 
     def __init__(
         self,
@@ -372,7 +372,6 @@ class TPShardedStoreLayout(StoreLayout):
         local_tp_size: int,
         store_tp_size: int,
         tp_rank: int,
-        num_kv_heads: int,
     ) -> None:
         super().__init__(metadata, block_size, hash_block_size)
         self.shards_per_rank = store_tp_size // local_tp_size
@@ -381,8 +380,6 @@ class TPShardedStoreLayout(StoreLayout):
             range(first_shard, first_shard + self.shards_per_rank)
         )
         self.store_tp_size = store_tp_size
-        self.heads_per_store_shard = num_kv_heads // store_tp_size
-        self.local_num_kv_heads = num_kv_heads // local_tp_size
         self._shard_key_prefixes = {
             shard_id: PoolKey.build_prefix(metadata, tp_rank=shard_id)
             for shard_id in self.store_shard_ids
@@ -469,7 +466,30 @@ class TPShardedStoreLayout(StoreLayout):
         return addrs.tolist(), sizes.tolist(), chunk_block_ids.tolist()
 
 
-class LBHNCStoreLayout(TPShardedStoreLayout):
+class AttentionStoreLayout(TPShardedStoreLayout):
+    def __init__(
+        self,
+        metadata: KeyMetadata,
+        block_size: int,
+        hash_block_size: int,
+        local_tp_size: int,
+        store_tp_size: int,
+        tp_rank: int,
+        num_kv_heads: int,
+    ) -> None:
+        super().__init__(
+            metadata,
+            block_size,
+            hash_block_size,
+            local_tp_size,
+            store_tp_size,
+            tp_rank,
+        )
+        self.heads_per_store_shard = num_kv_heads // store_tp_size
+        self.local_num_kv_heads = num_kv_heads // local_tp_size
+
+
+class LBHNCStoreLayout(AttentionStoreLayout):
     """Native head-major layout shared by divisible TP sizes."""
 
     store_format = "tp_shared_lbhnc"
@@ -504,7 +524,7 @@ class LBHNCStoreLayout(TPShardedStoreLayout):
                 and head_stride == self.block_size * content_bytes
             ):
                 raise ValueError(
-                    "TP-shared Mooncake store requires packed LBHNC KV layout"
+                    "TP-shared Mooncake store requires a packed head-major layout"
                 )
 
             for local_shard, (addr_bases, block_strides, sizes) in enumerate(templates):
@@ -516,7 +536,13 @@ class LBHNCStoreLayout(TPShardedStoreLayout):
         self._set_segment_templates(templates)
 
 
-class LBNHCStoreLayout(TPShardedStoreLayout):
+class BLHNCStoreLayout(LBHNCStoreLayout):
+    """Block-outermost head-major layout."""
+
+    store_format = "tp_shared_blhnc"
+
+
+class LBNHCStoreLayout(AttentionStoreLayout):
     """Native token-major layout shared by divisible TP sizes."""
 
     store_format = "tp_shared_lbnhc"
@@ -551,7 +577,7 @@ class LBNHCStoreLayout(TPShardedStoreLayout):
                 and token_stride == self.local_num_kv_heads * content_bytes
             ):
                 raise ValueError(
-                    "TP-shared Mooncake store requires packed LBNHC KV layout"
+                    "TP-shared Mooncake store requires a packed token-major layout"
                 )
 
             for local_shard, (addr_bases, block_strides, sizes) in enumerate(templates):
@@ -566,6 +592,71 @@ class LBNHCStoreLayout(TPShardedStoreLayout):
                     sizes.append(self.heads_per_store_shard * content_bytes)
 
         self._set_segment_templates(templates)
+
+
+class BLNHCStoreLayout(LBNHCStoreLayout):
+    """Block-outermost token-major layout."""
+
+    store_format = "tp_shared_blnhc"
+
+
+class LHBNCStoreLayout(AttentionStoreLayout):
+    """Head-outermost layout using one segment per local KV head."""
+
+    store_format = "tp_shared_lhbnc"
+
+    def register_kv_caches(
+        self,
+        kv_caches: Sequence[torch.Tensor],
+        num_blocks: int,
+    ) -> None:
+        templates: list[tuple[list[int], list[int], list[int]]] = [
+            ([], [], []) for _ in range(self.shards_per_rank)
+        ]
+        for cache in kv_caches:
+            if cache.ndim != 4 or tuple(cache.shape[:3]) != (
+                num_blocks,
+                self.local_num_kv_heads,
+                self.block_size,
+            ):
+                raise ValueError(
+                    "TP-shared Mooncake store requires packed KV caches with "
+                    "logical shape (num_blocks, local_kv_heads, block_size, content)"
+                )
+
+            element_size = cache.element_size()
+            block_stride, head_stride, token_stride, content_stride = (
+                stride * element_size for stride in cache.stride()
+            )
+            content_bytes = cache.shape[3] * element_size
+            head_bytes = self.block_size * content_bytes
+            if not (
+                content_stride == element_size
+                and token_stride == content_bytes
+                and block_stride >= head_bytes
+                and head_stride >= head_bytes
+            ):
+                raise ValueError(
+                    "TP-shared Mooncake store requires a packed head-outermost "
+                    "KV layout"
+                )
+
+            for local_shard, (addr_bases, block_strides, sizes) in enumerate(templates):
+                head_start = local_shard * self.heads_per_store_shard
+                for head_idx in range(
+                    head_start, head_start + self.heads_per_store_shard
+                ):
+                    addr_bases.append(cache.data_ptr() + head_idx * head_stride)
+                    block_strides.append(block_stride)
+                    sizes.append(head_bytes)
+
+        self._set_segment_templates(templates)
+
+
+class BHLNCStoreLayout(LHBNCStoreLayout):
+    """Block-outermost head/layer-interleaved layout."""
+
+    store_format = "tp_shared_bhlnc"
 
 
 class MambaStoreLayout(TPShardedStoreLayout):
@@ -590,7 +681,6 @@ class MambaStoreLayout(TPShardedStoreLayout):
             local_tp_size,
             store_tp_size,
             tp_rank,
-            num_kv_heads=store_tp_size,
         )
         self.spec = spec
         self._segments = self._state_segments(spec, local_tp_size, self.shards_per_rank)

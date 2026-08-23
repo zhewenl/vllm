@@ -9,15 +9,20 @@ import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    BHLNCStoreLayout,
+    BLHNCStoreLayout,
+    BLNHCStoreLayout,
     ChunkedTokenDatabase,
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
+    LHBNCStoreLayout,
     MambaStoreLayout,
     RankLocalStoreLayout,
 )
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 BLOCK_SIZE = 128
 
@@ -205,6 +210,10 @@ def test_rank_local_descriptors_handle_empty_and_invalid_chunks():
     [
         (LBHNCStoreLayout, "tp_shared_lbhnc"),
         (LBNHCStoreLayout, "tp_shared_lbnhc"),
+        (BLHNCStoreLayout, "tp_shared_blhnc"),
+        (BLNHCStoreLayout, "tp_shared_blnhc"),
+        (LHBNCStoreLayout, "tp_shared_lhbnc"),
+        (BHLNCStoreLayout, "tp_shared_bhlnc"),
     ],
 )
 def test_tp_shared_layout_owns_store_namespace(layout_cls, store_format):
@@ -231,27 +240,53 @@ def test_rank_local_database_api_rejects_tp_shared_layout():
         database.prepare_value_for_block(0)
 
 
-@pytest.mark.parametrize(
-    ("layout_cls", "producer_strides", "consumer_strides"),
-    [
-        (LBHNCStoreLayout, (128, 64, 4, 1), (256, 64, 4, 1)),
-        (LBNHCStoreLayout, (128, 4, 8, 1), (256, 4, 16, 1)),
-    ],
-)
+_SHARED_LAYOUTS = [
+    (KVCacheLayout.LBHNC, LBHNCStoreLayout),
+    (KVCacheLayout.LBNHC, LBNHCStoreLayout),
+    (KVCacheLayout.BLHNC, BLHNCStoreLayout),
+    (KVCacheLayout.BLNHC, BLNHCStoreLayout),
+    (KVCacheLayout.LHBNC, LHBNCStoreLayout),
+    (KVCacheLayout.BHLNC, BHLNCStoreLayout),
+]
+
+
+def _physical_layer_views(
+    layout: KVCacheLayout,
+    num_layers: int,
+    num_blocks: int,
+    num_heads: int,
+    block_size: int,
+    content_size: int,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    logical_shape = (num_layers, num_blocks, num_heads, block_size, content_size)
+    axis_order = layout.value
+    physical = torch.empty(
+        tuple(logical_shape[axis] for axis in axis_order), dtype=torch.float16
+    )
+    logical = physical.permute(tuple(axis_order.index(axis) for axis in range(5)))
+    return physical, list(logical.unbind(0))
+
+
+@pytest.mark.parametrize(("cache_layout", "layout_cls"), _SHARED_LAYOUTS)
 def test_tp_shared_layout_round_trip_across_tp_sizes(
-    layout_cls, producer_strides, consumer_strides
+    cache_layout: KVCacheLayout, layout_cls
 ):
     block_size = 16
-    shape = (1, 2, block_size, 4)
+    num_layers = 2
     stored: dict[int, bytes] = {}
-    producer_tensors = []
+    producer_layers = []
 
     for tp_rank in range(4):
-        tensor = torch.empty_strided(shape, producer_strides, dtype=torch.float16)
-        tensor.copy_(
-            torch.arange(128, dtype=torch.float16).view(shape) + tp_rank * 1000
+        physical, layers = _physical_layer_views(
+            cache_layout, num_layers, 1, 2, block_size, 4
         )
-        producer_tensors.append(tensor)
+        for layer_index, layer in enumerate(layers):
+            layer.copy_(
+                torch.arange(layer.numel(), dtype=torch.float16).view_as(layer)
+                + tp_rank * 1000
+                + layer_index * 100
+            )
+        producer_layers.append(layers)
         metadata = KeyMetadata("test-model", tp_rank, 0, 0, 0)
         layout = layout_cls(
             metadata,
@@ -262,7 +297,7 @@ def test_tp_shared_layout_round_trip_across_tp_sizes(
             tp_rank=tp_rank,
             num_kv_heads=8,
         )
-        layout.register_kv_caches([tensor], 1)
+        layout.register_kv_caches(layers, 1)
         addrs, sizes, _ = layout.prepare_values([(0, block_size)], [0], [tp_rank])
         stored[tp_rank] = b"".join(
             ctypes.string_at(addr, size)
@@ -270,10 +305,10 @@ def test_tp_shared_layout_round_trip_across_tp_sizes(
         )
 
     for tp_rank in range(2):
-        tensor = torch.empty_strided(
-            (1, 4, block_size, 4), consumer_strides, dtype=torch.float16
+        physical, layers = _physical_layer_views(
+            cache_layout, num_layers, 1, 4, block_size, 4
         )
-        tensor.zero_()
+        physical.zero_()
         metadata = KeyMetadata("test-model", tp_rank, 0, 0, 0)
         layout = layout_cls(
             metadata,
@@ -284,7 +319,7 @@ def test_tp_shared_layout_round_trip_across_tp_sizes(
             tp_rank=tp_rank,
             num_kv_heads=8,
         )
-        layout.register_kv_caches([tensor], 1)
+        layout.register_kv_caches(layers, 1)
         shard_ids = layout.local_shard_ids
         addrs, sizes, _ = layout.prepare_values(
             [(0, block_size)] * len(shard_ids), [0], shard_ids
@@ -297,5 +332,12 @@ def test_tp_shared_layout_round_trip_across_tp_sizes(
                 ctypes.memmove(addr, stored[shard_id][offset : offset + size], size)
                 offset += size
 
-        expected = torch.cat(producer_tensors[tp_rank * 2 : tp_rank * 2 + 2], dim=1)
-        torch.testing.assert_close(tensor, expected)
+        for layer_index, layer in enumerate(layers):
+            expected = torch.cat(
+                [
+                    rank_layers[layer_index]
+                    for rank_layers in producer_layers[tp_rank * 2 : tp_rank * 2 + 2]
+                ],
+                dim=1,
+            )
+            torch.testing.assert_close(layer, expected)

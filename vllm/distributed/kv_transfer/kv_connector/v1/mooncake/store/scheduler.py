@@ -21,6 +21,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
     LookupKeyClient,
+    resolve_store_job_block_size,
 )
 from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
@@ -76,6 +77,12 @@ class MooncakeStoreScheduler:
         )
         self.enable_partial_hash_hits = partial_hash_hits_enabled(
             kv_cache_config.kv_cache_groups, self._hash_block_size
+        )
+        self._store_job_block_size = resolve_store_job_block_size(
+            vllm_config,
+            kv_cache_config,
+            self._block_size,
+            self._hash_block_size,
         )
 
         # Per-request state
@@ -244,7 +251,8 @@ class MooncakeStoreScheduler:
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
-                self._block_size,
+                self._store_job_block_size,
+                event_block_size=self._block_size,
                 load_spec=load_spec,
                 # A consumer may write decode KV without becoming a prefill
                 # producer. Loads are still carried by the same metadata.
@@ -295,7 +303,8 @@ class MooncakeStoreScheduler:
 
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
-                        self._block_size,
+                        self._store_job_block_size,
+                        event_block_size=self._block_size,
                         load_spec=load_spec,
                         skip_save=is_consumer,
                         block_hashes=request_real.block_hashes,
@@ -336,7 +345,8 @@ class MooncakeStoreScheduler:
 
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
-                        self._block_size,
+                        self._store_job_block_size,
+                        event_block_size=self._block_size,
                         load_spec=None,
                         skip_save=False,
                         block_hashes=unfinished_req.block_hashes,
@@ -365,7 +375,8 @@ class MooncakeStoreScheduler:
                 self._request_trackers[request_id] = request_tracker
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
-                    self._block_size,
+                    self._store_job_block_size,
+                    event_block_size=self._block_size,
                     load_spec=load_spec,
                     skip_save=None,
                     block_hashes=unfinished_req.block_hashes,

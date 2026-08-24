@@ -180,14 +180,27 @@ four head-major layouts to one Store value order and the two token-major
 layouts to another. Physical layouts with the same value order can share
 entries.
 
+For hybrid cache allocations, the connector derives a stable attention Store
+chunk size from the common Store TP. A local attention block may contain
+several Store chunks, which are read and written through tensor-offset
+descriptors. Completed attention chunks can be stored before the next hybrid
+prefix boundary. Mamba and GDN entries remain complete state snapshots at
+their reusable prefix boundaries, and lookup exposes a prefix after all cache
+groups required at that boundary are present.
+
+Hybrid endpoints whose local block sizes differ must use the same
+`prefix_match_unit`, and it must divide the derived Store chunk size. This
+keeps request hashes and Store chunk keys aligned across TP sizes.
+
 Attention groups are planned from their per-layer cache specs, including specs
 wrapped by `UniformTypeKVCacheSpecs`. The Store TP and global head-slot count
 must divide one another; MQA and replicated GQA use the smaller head-slot count
-as the physical Store shard count. `MambaSpec` state segments must divide across
-the local rank's Store shards. All endpoints use the same PP size and Store TP;
-PCP, DCP, and cross-layer blocks remain rank-local. Each group namespace records
-its Store value format and schema fingerprint. Incompatible configurations use
-an isolated rank-local namespace.
+as the physical Store shard count. `MambaSpec` state segments map in complete
+state units; a replicated local unit can serve multiple Store shards. All
+endpoints use the same PP size and Store TP; PCP, DCP, and cross-layer blocks
+remain rank-local. Each group namespace records its Store value format and
+normalized value schema. Incompatible configurations use an isolated rank-local
+namespace.
 
 When `enable_store_tp_lcm` is absent or false, `prefill_tp_sizes` has no effect.
 

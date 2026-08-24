@@ -43,19 +43,9 @@ def _attention_specs(
     )
 
 
-def _make_gdn_store_layout(
-    *, local_tp_size: int, tp_rank: int
+def _make_state_store_layout(
+    spec, *, local_tp_size: int, tp_rank: int
 ) -> tuple[MambaStoreLayout, torch.Tensor]:
-    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-    from vllm.v1.kv_cache_interface import MambaSpec
-
-    local_factor = 4 // local_tp_size
-    spec = MambaSpec(
-        block_size=16,
-        shapes=((6 * local_factor, 3), (local_factor, 2, 2)),
-        dtypes=(torch.uint8, torch.uint8),
-        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
-    )
     tensor = torch.empty((2, 1, 1, spec.state_content_size_bytes), dtype=torch.uint8)
     metadata = KeyMetadata(
         "test-model",
@@ -79,6 +69,42 @@ def _make_gdn_store_layout(
     )
     layout.register_kv_caches([tensor], 2)
     return layout, tensor
+
+
+def _make_gdn_store_layout(
+    *, local_tp_size: int, tp_rank: int
+) -> tuple[MambaStoreLayout, torch.Tensor]:
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    local_factor = 4 // local_tp_size
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((6 * local_factor, 3), (local_factor, 2, 2)),
+        dtypes=(torch.uint8, torch.uint8),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    return _make_state_store_layout(spec, local_tp_size=local_tp_size, tp_rank=tp_rank)
+
+
+def _make_mamba2_store_layout(
+    *, local_tp_size: int, tp_rank: int
+) -> tuple[MambaStoreLayout, torch.Tensor]:
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    local_heads = 4 // local_tp_size
+    effective_groups = local_tp_size
+    spec = MambaSpec(
+        block_size=16,
+        shapes=(
+            ((8 + 2 * effective_groups * 2) // local_tp_size, 3),
+            (local_heads, 2, 2),
+        ),
+        dtypes=(torch.uint8, torch.uint8),
+        mamba_type=MambaAttentionBackendEnum.MAMBA2,
+    )
+    return _make_state_store_layout(spec, local_tp_size=local_tp_size, tp_rank=tp_rank)
 
 
 def _descriptors_for_block(
@@ -117,39 +143,56 @@ def test_tp_shared_layout_loads_partial_prefix_from_physical_block():
     assert block_ids == [1] * len(shard_ids)
 
 
-@pytest.mark.parametrize(("producer_tp", "consumer_tp"), [(4, 2), (2, 4)])
-def test_gdn_store_shards_round_trip_in_both_tp_directions(
-    monkeypatch, producer_tp: int, consumer_tp: int
-):
-    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+def _assert_state_store_round_trip(layout_factory):
     block_hash = BlockHash(b"h")
-    stored: dict[int, bytes] = {}
-    keys: dict[int, str] = {}
-    for tp_rank in range(producer_tp):
-        layout, cache = _make_gdn_store_layout(
-            local_tp_size=producer_tp, tp_rank=tp_rank
-        )
-        cache.copy_(torch.arange(cache.numel(), dtype=torch.uint8).view_as(cache))
-        cache.add_(tp_rank * 32)
-        for shard_id in layout.local_shard_ids:
-            addrs, sizes = _descriptors_for_block(layout, shard_id)
-            stored[shard_id] = _read_segments(addrs, sizes)
-            keys[shard_id] = layout.key_for(shard_id, block_hash)
+    for producer_tp, consumer_tp in ((4, 2), (2, 4)):
+        stored: dict[int, bytes] = {}
+        keys: dict[int, str] = {}
+        schemas: set[str] = set()
+        for tp_rank in range(producer_tp):
+            layout, cache = layout_factory(local_tp_size=producer_tp, tp_rank=tp_rank)
+            schemas.add(
+                MambaStoreLayout.schema_fingerprint(layout.layer_specs, producer_tp, 4)
+            )
+            cache.zero_()
+            for shard_id in layout.local_shard_ids:
+                addrs, sizes = _descriptors_for_block(layout, shard_id)
+                for segment_index, (addr, size) in enumerate(
+                    zip(addrs, sizes, strict=True)
+                ):
+                    value = 32 + segment_index * 16
+                    if segment_index in (0, 3):
+                        value += shard_id
+                    ctypes.memset(addr, value, size)
+                stored[shard_id] = _read_segments(addrs, sizes)
+                keys[shard_id] = layout.key_for(shard_id, block_hash)
 
-    assert set(stored) == set(range(4))
-    for tp_rank in range(consumer_tp):
-        layout, cache = _make_gdn_store_layout(
-            local_tp_size=consumer_tp, tp_rank=tp_rank
-        )
-        cache.zero_()
-        for shard_id in layout.local_shard_ids:
-            assert layout.key_for(shard_id, block_hash) == keys[shard_id]
-            addrs, sizes = _descriptors_for_block(layout, shard_id)
-            offset = 0
-            for addr, size in zip(addrs, sizes, strict=True):
-                ctypes.memmove(addr, stored[shard_id][offset : offset + size], size)
-                offset += size
-            assert _read_segments(addrs, sizes) == stored[shard_id]
+        for tp_rank in range(consumer_tp):
+            layout, cache = layout_factory(local_tp_size=consumer_tp, tp_rank=tp_rank)
+            schemas.add(
+                MambaStoreLayout.schema_fingerprint(layout.layer_specs, consumer_tp, 4)
+            )
+            cache.zero_()
+            for shard_id in layout.local_shard_ids:
+                assert layout.key_for(shard_id, block_hash) == keys[shard_id]
+                addrs, sizes = _descriptors_for_block(layout, shard_id)
+                offset = 0
+                for addr, size in zip(addrs, sizes, strict=True):
+                    ctypes.memmove(addr, stored[shard_id][offset : offset + size], size)
+                    offset += size
+                assert _read_segments(addrs, sizes) == stored[shard_id]
+        assert set(stored) == set(range(4))
+        assert len(schemas) == 1
+
+
+def test_gdn_store_shards_round_trip_in_both_tp_directions(monkeypatch):
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+    _assert_state_store_round_trip(_make_gdn_store_layout)
+
+
+def test_mamba2_replicated_groups_round_trip_in_both_tp_directions(monkeypatch):
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+    _assert_state_store_round_trip(_make_mamba2_store_layout)
 
 
 def test_gdn_store_shard_segments_preserve_projection_boundaries(monkeypatch):
@@ -367,6 +410,82 @@ def test_tp_shared_layout_round_trip_across_tp_sizes(
                 dim=1,
             )
             torch.testing.assert_close(layer, expected)
+
+
+@pytest.mark.parametrize(
+    ("cache_layout", "layout_cls"),
+    [
+        (KVCacheLayout.LBHNC, LBHNCStoreLayout),
+        (KVCacheLayout.LBNHC, LBNHCStoreLayout),
+    ],
+)
+def test_attention_store_layout_round_trip_across_local_block_sizes(
+    cache_layout, layout_cls
+):
+    metadata = KeyMetadata("test-model", 0, 0, 0, 0)
+    chunks = [(0, 400), (400, 800)]
+
+    _, (small_cache,) = _physical_layer_views(cache_layout, 1, 2, 2, 400, 4)
+    small_cache.copy_(
+        torch.arange(small_cache.numel(), dtype=torch.float16).view_as(small_cache)
+    )
+    small_layout = layout_cls(
+        metadata,
+        block_size=400,
+        hash_block_size=16,
+        local_tp_size=1,
+        store_tp_size=1,
+        tp_rank=0,
+        layer_specs=_attention_specs(1, 400, 2),
+        store_chunk_size=400,
+    )
+    small_layout.register_kv_caches([small_cache], num_blocks=2)
+    addrs, sizes, _ = small_layout.prepare_values(chunks, [0, 1], [0, 0])
+    stored = [_read_segments(a, s) for a, s in zip(addrs, sizes, strict=True)]
+
+    _, (large_cache,) = _physical_layer_views(cache_layout, 1, 1, 2, 800, 4)
+    large_cache.zero_()
+    large_layout = layout_cls(
+        metadata,
+        block_size=800,
+        hash_block_size=16,
+        local_tp_size=1,
+        store_tp_size=1,
+        tp_rank=0,
+        layer_specs=_attention_specs(1, 800, 2),
+        store_chunk_size=400,
+    )
+    large_layout.register_kv_caches([large_cache], num_blocks=1)
+    addrs, sizes, _ = large_layout.prepare_values(chunks, [0], [0, 0])
+    for value, value_addrs, value_sizes in zip(stored, addrs, sizes, strict=True):
+        offset = 0
+        for addr, size in zip(value_addrs, value_sizes, strict=True):
+            ctypes.memmove(addr, value[offset : offset + size], size)
+            offset += size
+    expected = torch.cat((small_cache[0], small_cache[1]), dim=1)
+    torch.testing.assert_close(large_cache[0], expected)
+
+    large_values = [_read_segments(a, s) for a, s in zip(addrs, sizes, strict=True)]
+    _, (restored_small,) = _physical_layer_views(cache_layout, 1, 2, 2, 400, 4)
+    restored_small.zero_()
+    restored_layout = layout_cls(
+        metadata,
+        block_size=400,
+        hash_block_size=16,
+        local_tp_size=1,
+        store_tp_size=1,
+        tp_rank=0,
+        layer_specs=_attention_specs(1, 400, 2),
+        store_chunk_size=400,
+    )
+    restored_layout.register_kv_caches([restored_small], num_blocks=2)
+    addrs, sizes, _ = restored_layout.prepare_values(chunks, [0, 1], [0, 0])
+    for value, value_addrs, value_sizes in zip(large_values, addrs, sizes, strict=True):
+        offset = 0
+        for addr, size in zip(value_addrs, value_sizes, strict=True):
+            ctypes.memmove(addr, value[offset : offset + size], size)
+            offset += size
+    torch.testing.assert_close(restored_small, small_cache)
 
 
 def test_tp_shared_layout_handles_kernel_blocked_compressed_states():

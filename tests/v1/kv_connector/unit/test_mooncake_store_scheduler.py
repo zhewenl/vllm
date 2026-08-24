@@ -31,6 +31,7 @@ def _make_bare_scheduler(
     scheduler.lookup_async = False
     scheduler.enable_lookup = True
     scheduler._block_size = 16
+    scheduler._store_job_block_size = scheduler._block_size
     scheduler._hash_block_size = hash_block_size
     scheduler.enable_partial_hash_hits = enable_partial_hash_hits
     scheduler.load_specs = {}

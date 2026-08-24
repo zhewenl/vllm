@@ -42,6 +42,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     PoolKey,
     RankLocalStoreLayout,
     ReqMeta,
+    RequestTracker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
@@ -163,6 +164,7 @@ def _make_store_sending_thread(
     enable_group_semantics: bool = False,
     supports_group_ids: bool = False,
     kv_role: str = "kv_producer",
+    enable_kv_event: bool = False,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
         coord = _default_send_coord()
@@ -180,6 +182,7 @@ def _make_store_sending_thread(
         group_put_steps=[put_step] * len(token_databases),
         kv_role=kv_role,
         ready_event=threading.Event(),
+        enable_kv_event=enable_kv_event,
         replicate_config=replicate_config,
         enable_group_semantics=enable_group_semantics,
         supports_group_ids=supports_group_ids,
@@ -272,6 +275,35 @@ def _make_multi_group_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMe
     )
 
 
+def test_request_tracker_keeps_event_tokens_from_hybrid_checkpoint():
+    tracker = RequestTracker(
+        req_id="r0",
+        token_len=12,
+        allocated_block_ids=([1, 2],),
+        num_saved_tokens=8,
+        token_ids=list(range(16)),
+    )
+
+    first = ReqMeta.from_request_tracker(
+        tracker,
+        block_size=4,
+        event_block_size=8,
+    )
+    assert first is not None
+    assert first.token_ids_start == 8
+    assert first.token_ids == list(range(8, 12))
+
+    tracker.token_len = 16
+    second = ReqMeta.from_request_tracker(
+        tracker,
+        block_size=4,
+        event_block_size=8,
+    )
+    assert second is not None
+    assert second.token_ids_start == 8
+    assert second.token_ids == list(range(8, 16))
+
+
 _DISK_OFFLOAD_SINGLE_KEY_BYTES = worker._estimate_disk_offload_staging_bytes([256])
 _DISK_OFFLOAD_USABLE_BUDGET_RATIO = 0.9
 _DISK_OFFLOAD_BUDGET_FOR_THREE_KEYS = 4 * _DISK_OFFLOAD_SINGLE_KEY_BYTES
@@ -315,6 +347,7 @@ def _make_vllm_config(
     decode_context_parallel_size: int = 1,
     kv_role: str = "kv_both",
     pipeline_parallel_size: int = 1,
+    tensor_parallel_size: int = 1,
     kv_cache_layout: KVCacheLayout = KVCacheLayout.LBHNC,
 ) -> SimpleNamespace:
     cache_config = SimpleNamespace(
@@ -328,6 +361,7 @@ def _make_vllm_config(
         model_config=_FakeModelConfig(),
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=pipeline_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
             rank=rank,
             data_parallel_index=0,
             decode_context_parallel_size=decode_context_parallel_size,
@@ -370,8 +404,8 @@ def _make_hybrid_gdn_kv_cache_config(tp_size: int) -> object:
     from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
     full = FullAttentionSpec(
-        block_size=16,
-        num_kv_heads=8 // tp_size,
+        block_size=1600 // tp_size,
+        num_kv_heads=1,
         head_size=64,
         dtype=None,
     )
@@ -381,6 +415,7 @@ def _make_hybrid_gdn_kv_cache_config(tp_size: int) -> object:
         shapes=((6 * local_factor, 3), (local_factor, 2, 2)),
         dtypes=(torch.uint8, torch.uint8),
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        mamba_cache_mode="align",
     )
     return KVCacheConfig(
         num_blocks=10,
@@ -2085,7 +2120,7 @@ def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(tmp_path, monke
     store = MagicMock()
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
-    monkeypatch.setattr(_FakeModelConfig, "get_total_num_kv_heads", lambda _self: 8)
+    monkeypatch.setattr(_FakeModelConfig, "get_total_num_kv_heads", lambda _self: 2)
     monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
     monkeypatch.setenv(
         "MOONCAKE_CONFIG_PATH",
@@ -2102,19 +2137,31 @@ def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(tmp_path, monke
     workers = []
     for tp_size, tp_rank in ((2, 0), (4, 1)):
         _patch_worker_runtime(monkeypatch, tp_size=tp_size, tp_rank=tp_rank)
-        store_worker = worker.MooncakeStoreWorker(
-            _make_vllm_config(extra_config={"store_tp_size": 4}),
-            _make_hybrid_gdn_kv_cache_config(tp_size),
+        config = _make_vllm_config(
+            extra_config={"store_tp_size": 4},
+            tensor_parallel_size=tp_size,
         )
+        kv_cache_config = _make_hybrid_gdn_kv_cache_config(tp_size)
+        store_worker = worker.MooncakeStoreWorker(config, kv_cache_config)
         assert store_worker.store_tp_size == 4
         assert isinstance(store_worker.token_dbs[0].store_layout, LBHNCStoreLayout)
         assert isinstance(store_worker.token_dbs[1].store_layout, MambaStoreLayout)
-        assert len(store_worker._lookup_key_prefixes[0]) == 4
+        assert store_worker.token_dbs[0].chunk_size == 400
+        assert (
+            worker.resolve_store_job_block_size(
+                config,
+                kv_cache_config,
+                store_worker.block_size,
+                store_worker.hash_block_size,
+            )
+            == 400
+        )
+        assert len(store_worker._lookup_key_prefixes[0]) == 2
         assert len(store_worker._lookup_key_prefixes[1]) == 4
         workers.append(store_worker)
 
-    full_key_tp2 = workers[0].token_dbs[0].store_layout.key_for(1, BlockHash(b"h"))
-    full_key_tp4 = workers[1].token_dbs[0].store_layout.key_for(1, BlockHash(b"h"))
+    full_key_tp2 = workers[0].token_dbs[0].store_layout.key_for(0, BlockHash(b"h"))
+    full_key_tp4 = workers[1].token_dbs[0].store_layout.key_for(0, BlockHash(b"h"))
     gdn_key_tp2 = workers[0].token_dbs[1].store_layout.key_for(1, BlockHash(b"h"))
     gdn_key_tp4 = workers[1].token_dbs[1].store_layout.key_for(1, BlockHash(b"h"))
     assert full_key_tp2 == full_key_tp4
@@ -2131,7 +2178,7 @@ def test_hybrid_gdn_falls_back_when_state_cannot_be_store_sharded(
     store = MagicMock()
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
-    monkeypatch.setattr(_FakeModelConfig, "get_total_num_kv_heads", lambda _self: 8)
+    monkeypatch.setattr(_FakeModelConfig, "get_total_num_kv_heads", lambda _self: 2)
     _patch_worker_runtime(monkeypatch, tp_size=2)
     monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
     monkeypatch.setenv(
@@ -2476,7 +2523,7 @@ def test_worker_put_striding_covers_every_rank_get_namespace(
             _make_kv_cache_config(),
         )
         db = w.token_dbs[0]
-        token_len = len(block_hashes) * db.block_size
+        token_len = len(block_hashes) * db.chunk_size
         keys = [
             PoolKey(db.metadata, block_hash.hex()).to_string()
             for _, _, block_hash in db.process_tokens(token_len, block_hashes)
@@ -2696,6 +2743,118 @@ def test_store_sending_thread_clamps_token_len_to_lcm():
 
     keys = store.batch_put_from_multi_buffers.call_args.args[0]
     assert len(keys) == 2
+
+
+def test_store_sending_thread_publishes_attention_before_hybrid_checkpoint():
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = (
+        lambda keys, addrs, sizes, replicate_config: [256] * len(keys)
+    )
+
+    full = FullAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float16,
+    )
+    mamba = MambaSpec(
+        block_size=8,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        [
+            KVCacheGroupSpec(["full"], full),
+            KVCacheGroupSpec(["mamba"], mamba),
+        ],
+        scheduler_block_size=8,
+        hash_block_size=4,
+    )
+
+    metadata = KeyMetadata("test-model", 0, 0, 0, 0, group_id=0)
+    layout = LBHNCStoreLayout(
+        metadata,
+        block_size=8,
+        hash_block_size=4,
+        local_tp_size=2,
+        store_tp_size=2,
+        tp_rank=0,
+        layer_specs=(full,),
+        store_chunk_size=4,
+    )
+    tensor = torch.empty((3, 1, 8, 4), dtype=torch.float16)
+    layout.register_kv_caches([tensor], num_blocks=3)
+    full_db = ChunkedTokenDatabase(
+        metadata,
+        block_size=4,
+        hash_block_size=4,
+        store_layout=layout,
+    )
+    mamba_db = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
+        block_size=8,
+        hash_block_size=4,
+    )
+    mamba_db.set_kv_caches_base_addr([0x2000])
+    mamba_db.set_block_len([256])
+
+    thread = _make_store_sending_thread(
+        store,
+        coord=coord,
+        token_databases=[full_db, mamba_db],
+        block_size=8,
+        enable_kv_event=True,
+    )
+    thread.update_kv_event = MagicMock()
+    thread._saved_offset["r0"] = 8
+    _run_store_req(
+        thread,
+        ReqMeta(
+            req_id="r0",
+            token_len_chunk=12,
+            block_ids=([1, 2, 3], [4, 5, 6]),
+            block_hashes=[b"a0", b"a1", b"a2"],
+            can_save=True,
+            token_ids=[8, 9, 10, 11],
+            token_ids_start=8,
+        ),
+    )
+
+    keys = store.batch_put_from_multi_buffers.call_args.args[0]
+    assert len(keys) == 1
+    assert "@group:0" in keys[0]
+    assert thread._saved_offset["r0"] == 8
+    events = thread.update_kv_event.call_args.args[0]
+    assert [(event.group_idx, event.block_size) for event in events] == [(0, 4)]
+
+    store.batch_is_exist.side_effect = None
+    store.batch_is_exist.return_value = [1, 0, 0]
+    store.batch_put_from_multi_buffers.reset_mock()
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    thread.update_kv_event.reset_mock()
+    _run_store_req(
+        thread,
+        ReqMeta(
+            req_id="r0",
+            token_len_chunk=16,
+            block_ids=([1, 2, 3], [4, 5, 6]),
+            block_hashes=[b"a0", b"a1", b"a2", b"a3"],
+            can_save=True,
+            token_ids=list(range(8, 16)),
+            token_ids_start=8,
+        ),
+    )
+
+    keys = store.batch_put_from_multi_buffers.call_args.args[0]
+    assert len(keys) == 2
+    assert {"@group:0" in key for key in keys} == {False, True}
+    assert thread._saved_offset["r0"] == 16
+    events = thread.update_kv_event.call_args.args[0]
+    assert {event.group_idx for event in events} == {0, 1}
 
 
 def test_store_sending_thread_skips_when_token_len_below_lcm():

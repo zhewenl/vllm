@@ -54,14 +54,16 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
-_TP_SHARED_NAMESPACE = "@store_tp:4@store_pp:1@store_format:tp_shared_lbhnc"
+_TP_SHARED_NAMESPACE = (
+    "@store_tp:4@store_pp:1@store_format:attention_head_major@store_schema:test"
+)
 _STORE_LAYOUT_CASES = [
-    (KVCacheLayout.LBHNC, LBHNCStoreLayout, "tp_shared_lbhnc"),
-    (KVCacheLayout.LBNHC, LBNHCStoreLayout, "tp_shared_lbnhc"),
-    (KVCacheLayout.BLHNC, BLHNCStoreLayout, "tp_shared_blhnc"),
-    (KVCacheLayout.BLNHC, BLNHCStoreLayout, "tp_shared_blnhc"),
-    (KVCacheLayout.LHBNC, LHBNCStoreLayout, "tp_shared_lhbnc"),
-    (KVCacheLayout.BHLNC, BHLNCStoreLayout, "tp_shared_bhlnc"),
+    (KVCacheLayout.LBHNC, LBHNCStoreLayout, "attention_head_major"),
+    (KVCacheLayout.LBNHC, LBNHCStoreLayout, "attention_token_major"),
+    (KVCacheLayout.BLHNC, BLHNCStoreLayout, "attention_head_major"),
+    (KVCacheLayout.BLNHC, BLNHCStoreLayout, "attention_token_major"),
+    (KVCacheLayout.LHBNC, LHBNCStoreLayout, "attention_head_major"),
+    (KVCacheLayout.BHLNC, BHLNCStoreLayout, "attention_head_major"),
 ]
 
 
@@ -135,7 +137,14 @@ def _make_tp_shared_db(
         local_tp_size=2,
         store_tp_size=4,
         tp_rank=tp_rank,
-        num_kv_heads=8,
+        layer_specs=(
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=local_heads,
+                head_size=content_size // 2,
+                dtype=torch.float16,
+            ),
+        ),
     )
     db = ChunkedTokenDatabase(metadata, block_size, store_layout=layout)
     layout.register_kv_caches([tensor], num_blocks)
@@ -334,13 +343,19 @@ def _make_vllm_config(
 
 
 def _make_kv_cache_config(
-    *, block_size: int = 16, prefix_cache_retention_interval: int | None = 0
+    *,
+    block_size: int = 16,
+    num_kv_heads: int = 8,
+    prefix_cache_retention_interval: int | None = 0,
 ) -> object:
     """Minimal single-group KVCacheConfig for topology tests."""
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
     spec = FullAttentionSpec(
-        block_size=block_size, num_kv_heads=8, head_size=64, dtype=None
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=64,
+        dtype=None,
     )
     return KVCacheConfig(
         num_blocks=10,
@@ -354,7 +369,12 @@ def _make_hybrid_gdn_kv_cache_config(tp_size: int) -> object:
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
-    full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+    full = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8 // tp_size,
+        head_size=64,
+        dtype=None,
+    )
     local_factor = 4 // tp_size
     gdn = MambaSpec(
         block_size=16,
@@ -1352,6 +1372,24 @@ def test_store_recving_thread_reports_all_attempted_blocks_on_exception():
     assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
 
 
+def test_store_recving_thread_finishes_when_group_masks_select_no_keys():
+    store = MagicMock()
+    thread = _make_store_recving_thread(store)
+    thread.coord.load_mask = MagicMock(return_value=[[False]])
+
+    thread._handle_request(
+        _make_load_req(
+            "req-a",
+            [b"a0"],
+            token_len=16,
+        )
+    )
+
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+    assert thread.get_and_clear_block_ids_with_load_errors() == set()
+    store.batch_get_into_multi_buffers.assert_not_called()
+
+
 def test_store_worker_get_block_ids_with_load_errors_delegates_to_recv_thread():
     recv_thread = MagicMock()
     recv_thread.get_and_clear_block_ids_with_load_errors.return_value = {3, 4}
@@ -2031,12 +2069,12 @@ def test_worker_enables_store_tp_layout(
         _make_vllm_config(
             extra_config={"store_tp_size": 4}, kv_cache_layout=cache_layout
         ),
-        _make_kv_cache_config(),
+        _make_kv_cache_config(num_kv_heads=4),
     )
 
     assert w.store_tp_size == 4
-    assert w.token_dbs[0].metadata.store_namespace == (
-        f"@store_tp:4@store_pp:1@store_format:{store_format}"
+    assert w.token_dbs[0].metadata.store_namespace.startswith(
+        f"@store_tp:4@store_pp:1@store_format:{store_format}@store_schema:"
     )
     assert isinstance(w.token_dbs[0].store_layout, layout_cls)
     assert w.token_dbs[0].store_layout.local_shard_ids == (0, 1)
@@ -2083,7 +2121,8 @@ def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(tmp_path, monke
     assert gdn_key_tp2 == gdn_key_tp4
     assert "@group:0" in full_key_tp2
     assert "@group:1" in gdn_key_tp2
-    assert "@store_format:tp_shared_hybrid_lbhnc" in full_key_tp2
+    assert "@store_format:attention_head_major" in full_key_tp2
+    assert "@store_format:mamba_state" in gdn_key_tp2
 
 
 def test_hybrid_gdn_falls_back_when_state_cannot_be_store_sharded(
@@ -2191,7 +2230,7 @@ def test_lcm_store_tp_gives_prefill_and_decode_common_namespace(tmp_path, monkey
             extra_config["save_decode_cache"] = True
         store_worker = worker.MooncakeStoreWorker(
             _make_vllm_config(extra_config=extra_config, kv_role=kv_role),
-            _make_kv_cache_config(),
+            _make_kv_cache_config(num_kv_heads=8 // tp_size),
         )
         assert store_worker.store_tp_size == 4
         assert isinstance(store_worker.token_dbs[0].store_layout, LBHNCStoreLayout)
@@ -2245,7 +2284,7 @@ def test_lcm_store_tp_falls_back_when_topology_is_incompatible(
                 "prefill_tp_sizes": prefill_tp_sizes,
             }
         ),
-        _make_kv_cache_config(),
+        _make_kv_cache_config(num_kv_heads=max(1, 8 // tp_size)),
     )
 
     assert store_worker.store_tp_size is None
@@ -2283,7 +2322,7 @@ def test_worker_keeps_rank_local_layout_for_unsupported_store_tp(
             extra_config={"store_tp_size": store_tp_size},
             kv_cache_layout=KVCacheLayout.LBNHC,
         ),
-        _make_kv_cache_config(),
+        _make_kv_cache_config(num_kv_heads=4),
     )
 
     assert w.store_tp_size is None
@@ -2319,7 +2358,7 @@ def test_store_tp_opt_in_isolates_different_pp_sizes(tmp_path, monkeypatch):
                 extra_config={"store_tp_size": 4},
                 pipeline_parallel_size=pp_size,
             ),
-            _make_kv_cache_config(),
+            _make_kv_cache_config(num_kv_heads=4),
         )
         layout = w.token_dbs[0].store_layout
         keys.append(layout.key_for(layout.local_shard_ids[0], BlockHash(b"h")))
@@ -2484,12 +2523,13 @@ def test_mqa_p4_to_d2_uses_shared_rank_zero_namespace(tmp_path, monkeypatch):
                     rank=tp_rank,
                     extra_config={"store_tp_size": 4},
                 ),
-                _make_kv_cache_config(),
+                _make_kv_cache_config(num_kv_heads=1),
             )
 
-            assert w.store_tp_size is None
+            assert w.store_tp_size == 4
             assert w.token_dbs[0].metadata.tp_rank == 0
-            key = w.token_dbs[0].key_for(block_hash)
+            layout = w.token_dbs[0].store_layout
+            key = layout.key_for(0, block_hash)
             if tp_size == 4:
                 put_step = w._group_tp_replication_factors[0]
                 if tp_rank % put_step == 0:
@@ -2497,16 +2537,11 @@ def test_mqa_p4_to_d2_uses_shared_rank_zero_namespace(tmp_path, monkeypatch):
             else:
                 target.add(key)
 
-    assert (
-        put_keys
-        == get_keys
-        == {
-            (
-                "test-model@store_pp:1@store_format:tp_shared_mqa"
-                "@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@68617368"
-            )
-        }
-    )
+    assert put_keys == get_keys
+    assert len(put_keys) == 1
+    key = next(iter(put_keys))
+    assert "@store_tp:4@store_pp:1@store_format:attention_head_major" in key
+    assert "@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@68617368" in key
 
 
 def test_requester_worker_group_semantics_falls_back_without_group_ids(
@@ -3162,7 +3197,14 @@ def test_lookup_key_prefixes_cover_store_tp_shards():
                 local_tp_size=2,
                 store_tp_size=4,
                 tp_rank=0,
-                num_kv_heads=8,
+                layer_specs=(
+                    FullAttentionSpec(
+                        block_size=16,
+                        num_kv_heads=4,
+                        head_size=2,
+                        dtype=torch.float16,
+                    ),
+                ),
             ),
         )
     ]
@@ -3312,6 +3354,115 @@ def test_uniform_group_uses_common_inner_replication_factor(spec_order):
         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0",
         "test-model@tp_rank:1@pcp0@dcp0@pp_rank:0@group:0",
     )
+
+
+def test_store_group_plans_cover_kimi_k3_and_deepseek_v4_specs(monkeypatch):
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.kv_cache_interface import (
+        KVCacheGroupSpec,
+        MambaSpec,
+        MLAAttentionSpec,
+        SlidingWindowMLASpec,
+        UniformTypeKVCacheSpecs,
+    )
+
+    worker = _make_bare_worker(block_size=64)
+    worker.tp_size = 4
+    worker.tp_rank = 3
+    worker.num_kv_head = 1
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+
+    mla_specs = {
+        name: MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.bfloat16,
+            tokens_per_state=4,
+            model_version="deepseek_v4",
+        )
+        for name in ("mla0", "mla1")
+    }
+    swa_specs = {
+        name: SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.bfloat16,
+            tokens_per_state=4,
+            model_version="deepseek_v4",
+            sliding_window=128,
+        )
+        for name in ("swa0", "swa1")
+    }
+    gdn = MambaSpec(
+        block_size=64,
+        shapes=((6, 3), (1, 2, 2)),
+        dtypes=(torch.uint8, torch.uint8),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    groups = [
+        KVCacheGroupSpec(
+            list(mla_specs),
+            UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=mla_specs),
+        ),
+        KVCacheGroupSpec(
+            list(swa_specs),
+            UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=swa_specs),
+        ),
+        KVCacheGroupSpec(["gdn"], gdn),
+    ]
+
+    plans = [
+        worker._make_store_group_plan(
+            group,
+            requested_store_tp_size=4,
+            attention_layout_cls=LBHNCStoreLayout,
+            replication_factor=worker._spec_tp_replication_factor(group.kv_cache_spec),
+        )
+        for group in groups
+    ]
+
+    assert all(plan is not None for plan in plans)
+    assert [plan.layout_cls for plan in plans if plan is not None] == [
+        LBHNCStoreLayout,
+        LBHNCStoreLayout,
+        MambaStoreLayout,
+    ]
+    assert [plan.store_shard_count for plan in plans if plan is not None] == [1, 1, 4]
+
+
+def test_attention_store_plan_uses_value_schema():
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+    worker = _make_bare_worker(block_size=16)
+    worker.tp_size = 2
+    worker.tp_rank = 0
+    worker.num_kv_head = 8
+
+    def plan(dtype: torch.dtype, layout_cls):
+        spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=dtype,
+        )
+        return worker._make_store_group_plan(
+            KVCacheGroupSpec(["layer"], spec),
+            requested_store_tp_size=4,
+            attention_layout_cls=layout_cls,
+            replication_factor=1,
+        )
+
+    lbhnc = plan(torch.bfloat16, LBHNCStoreLayout)
+    blhnc = plan(torch.bfloat16, BLHNCStoreLayout)
+    fp8 = plan(torch.float8_e4m3fn, LBHNCStoreLayout)
+
+    assert lbhnc is not None and blhnc is not None and fp8 is not None
+    assert lbhnc.layout_cls.store_format == "attention_head_major"
+    assert blhnc.layout_cls.store_format == "attention_head_major"
+    assert lbhnc.schema_fingerprint == blhnc.schema_fingerprint
+    assert lbhnc.schema_fingerprint != fp8.schema_fingerprint
 
 
 def test_lookup_rejects_boundary_missing_one_mamba_shard():

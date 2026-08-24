@@ -27,6 +27,22 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 BLOCK_SIZE = 128
 
 
+def _attention_specs(
+    num_layers: int, block_size: int, local_heads: int, content_size: int = 4
+):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    return tuple(
+        FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=local_heads,
+            head_size=content_size // 2,
+            dtype=torch.float16,
+        )
+        for _ in range(num_layers)
+    )
+
+
 def _make_gdn_store_layout(
     *, local_tp_size: int, tp_rank: int
 ) -> tuple[MambaStoreLayout, torch.Tensor]:
@@ -48,7 +64,9 @@ def _make_gdn_store_layout(
         0,
         0,
         group_id=1,
-        store_namespace="@store_tp:4@store_pp:1@store_format:tp_shared_hybrid_lbhnc",
+        store_namespace=(
+            "@store_tp:4@store_pp:1@store_format:mamba_state@store_schema:test"
+        ),
     )
     layout = MambaStoreLayout(
         metadata,
@@ -57,7 +75,7 @@ def _make_gdn_store_layout(
         local_tp_size=local_tp_size,
         store_tp_size=4,
         tp_rank=tp_rank,
-        spec=spec,
+        layer_specs=(spec,),
     )
     layout.register_kv_caches([tensor], 2)
     return layout, tensor
@@ -85,7 +103,7 @@ def test_tp_shared_layout_loads_partial_prefix_from_physical_block():
         local_tp_size=2,
         store_tp_size=4,
         tp_rank=0,
-        num_kv_heads=8,
+        layer_specs=_attention_specs(1, 16, 4),
     )
     tensor = torch.empty((2, 4, 16, 4), dtype=torch.float16)
     layout.register_kv_caches([tensor], 2)
@@ -214,7 +232,7 @@ def test_rank_local_database_api_rejects_tp_shared_layout():
         local_tp_size=2,
         store_tp_size=4,
         tp_rank=0,
-        num_kv_heads=8,
+        layer_specs=_attention_specs(1, 16, 4),
     )
     database = ChunkedTokenDatabase(metadata, 16, store_layout=layout)
 
@@ -249,9 +267,35 @@ def _physical_layer_views(
     return physical, list(logical.unbind(0))
 
 
-@pytest.mark.parametrize(("cache_layout", "layout_cls"), _SHARED_LAYOUTS)
+@pytest.mark.parametrize(
+    ("producer_layout", "producer_cls", "consumer_layout", "consumer_cls"),
+    [(layout, layout_cls, layout, layout_cls) for layout, layout_cls in _SHARED_LAYOUTS]
+    + [
+        (
+            KVCacheLayout.LBHNC,
+            LBHNCStoreLayout,
+            KVCacheLayout.BLHNC,
+            BLHNCStoreLayout,
+        ),
+        (
+            KVCacheLayout.LHBNC,
+            LHBNCStoreLayout,
+            KVCacheLayout.BHLNC,
+            BHLNCStoreLayout,
+        ),
+        (
+            KVCacheLayout.LBNHC,
+            LBNHCStoreLayout,
+            KVCacheLayout.BLNHC,
+            BLNHCStoreLayout,
+        ),
+    ],
+)
 def test_tp_shared_layout_round_trip_across_tp_sizes(
-    cache_layout: KVCacheLayout, layout_cls
+    producer_layout: KVCacheLayout,
+    producer_cls,
+    consumer_layout: KVCacheLayout,
+    consumer_cls,
 ):
     block_size = 16
     num_layers = 2
@@ -260,7 +304,7 @@ def test_tp_shared_layout_round_trip_across_tp_sizes(
 
     for tp_rank in range(4):
         physical, layers = _physical_layer_views(
-            cache_layout, num_layers, 1, 2, block_size, 4
+            producer_layout, num_layers, 1, 2, block_size, 4
         )
         for layer_index, layer in enumerate(layers):
             layer.copy_(
@@ -270,14 +314,14 @@ def test_tp_shared_layout_round_trip_across_tp_sizes(
             )
         producer_layers.append(layers)
         metadata = KeyMetadata("test-model", tp_rank, 0, 0, 0)
-        layout = layout_cls(
+        layout = producer_cls(
             metadata,
             block_size,
             block_size,
             local_tp_size=4,
             store_tp_size=4,
             tp_rank=tp_rank,
-            num_kv_heads=8,
+            layer_specs=_attention_specs(num_layers, block_size, 2),
         )
         layout.register_kv_caches(layers, 1)
         addrs, sizes, _ = layout.prepare_values([(0, block_size)], [0], [tp_rank])
@@ -288,18 +332,18 @@ def test_tp_shared_layout_round_trip_across_tp_sizes(
 
     for tp_rank in range(2):
         physical, layers = _physical_layer_views(
-            cache_layout, num_layers, 1, 4, block_size, 4
+            consumer_layout, num_layers, 1, 4, block_size, 4
         )
         physical.zero_()
         metadata = KeyMetadata("test-model", tp_rank, 0, 0, 0)
-        layout = layout_cls(
+        layout = consumer_cls(
             metadata,
             block_size,
             block_size,
             local_tp_size=2,
             store_tp_size=4,
             tp_rank=tp_rank,
-            num_kv_heads=8,
+            layer_specs=_attention_specs(num_layers, block_size, 4),
         )
         layout.register_kv_caches(layers, 1)
         shard_ids = layout.local_shard_ids
@@ -323,3 +367,34 @@ def test_tp_shared_layout_round_trip_across_tp_sizes(
                 dim=1,
             )
             torch.testing.assert_close(layer, expected)
+
+
+def test_tp_shared_layout_handles_kernel_blocked_compressed_states():
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, group_kernel_blocks
+
+    spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.uint8,
+        tokens_per_state=4,
+        model_version="deepseek_v4",
+    )
+    cache = torch.arange(2 * 4 * 8, dtype=torch.uint8).view(8, 1, 1, 8)
+    cache = group_kernel_blocks(cache, num_blocks=2)
+    metadata = KeyMetadata("test-model", 0, 0, 0, 0)
+    layout = LBHNCStoreLayout(
+        metadata,
+        block_size=16,
+        hash_block_size=4,
+        local_tp_size=1,
+        store_tp_size=1,
+        tp_rank=0,
+        layer_specs=(spec,),
+    )
+
+    layout.register_kv_caches([cache], num_blocks=2)
+    addrs, sizes, _ = layout.prepare_values([(0, 16)], [0], [0])
+
+    assert sizes == [[8, 8, 8, 8]]
+    assert _read_segments(addrs[0], sizes[0]) == bytes(range(32))

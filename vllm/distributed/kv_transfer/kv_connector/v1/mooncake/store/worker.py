@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 import regex as re
 import torch
@@ -42,6 +42,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
     MooncakeStoreCoordinator,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
+    AttentionStoreLayout,
     BHLNCStoreLayout,
     BLHNCStoreLayout,
     BLNHCStoreLayout,
@@ -55,7 +56,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     MooncakeStoreConnectorMetadata,
     MooncakeStoreWorkerMetadata,
     PoolKey,
-    RankLocalStoreLayout,
     ReqMeta,
     StoreLayout,
     StoreShardId,
@@ -76,7 +76,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -98,6 +98,36 @@ DEFAULT_TENANT_ID = "default"
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
 _T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _StoreGroupPlan:
+    layer_specs: tuple[KVCacheSpec, ...]
+    local_tp_size: int
+    store_shard_count: int
+    tp_rank: int
+    layout_cls: type[StoreLayout]
+    schema_fingerprint: str
+
+
+_STORE_SPEC_FAMILIES: dict[type[KVCacheSpec], Literal["attention", "mamba"]] = {
+    AttentionSpec: "attention",
+    MambaSpec: "mamba",
+}
+
+
+def _store_spec_family(spec: KVCacheSpec) -> Literal["attention", "mamba"] | None:
+    for spec_cls in type(spec).__mro__:
+        if family := _STORE_SPEC_FAMILIES.get(spec_cls):
+            return family
+    return None
+
+
+def _group_layer_specs(group: KVCacheGroupSpec) -> tuple[KVCacheSpec, ...]:
+    group_spec = group.kv_cache_spec
+    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+        return tuple(group_spec.kv_cache_specs[name] for name in group.layer_names)
+    return (group_spec,) * len(group.layer_names)
 
 
 def resolve_store_tp_size(extra_config: dict[str, Any]) -> int | None:
@@ -1272,6 +1302,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             size_list.extend(g_sizes)
             block_id_list.extend(g_block_ids)
 
+        if not key_list:
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
+
         # Rotate aligned lists by tp_rank for load balancing.
         rotation = self.tp_rank % len(key_list)
         key_list_c = _rotate_list(key_list, rotation)
@@ -1590,12 +1625,15 @@ class MooncakeStoreWorker:
             groups = [
                 dataclasses.replace(
                     g,
-                    kv_cache_spec=dataclasses.replace(
-                        g.kv_cache_spec, block_size=self.block_size
+                    kv_cache_spec=g.kv_cache_spec.copy_with_new_block_size(
+                        self.block_size
                     ),
                 )
             ]
         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
+        self._group_tp_replication_factors = (
+            self._compute_group_tp_replication_factors()
+        )
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
             spec_cfg.use_eagle()
@@ -1629,72 +1667,51 @@ class MooncakeStoreWorker:
                 KVCacheLayout.LHBNC: LHBNCStoreLayout,
                 KVCacheLayout.BHLNC: BHLNCStoreLayout,
             }.get(cache_layout)
-        group_specs = [group.kv_cache_spec for group in self._kv_cache_groups]
-        full_attention_specs = [
-            spec for spec in group_specs if type(spec) is FullAttentionSpec
-        ]
-        mamba_specs = [spec for spec in group_specs if type(spec) is MambaSpec]
-        supported_group_types = len(full_attention_specs) + len(mamba_specs) == len(
-            group_specs
-        )
-        share_tp_topology = (
-            store_layout_cls is not None
-            and self.pcp_size == 1
-            and self.dcp_size == 1
-            and supported_group_types
-            and len(full_attention_specs) == 1
-            and str(extra_config.get("enable_cross_layers_blocks", "False")).lower()
-            != "true"
-        )
-        valid_tp_mapping = (
-            requested_store_tp_size is not None
-            and requested_store_tp_size >= self.tp_size
-            and requested_store_tp_size % self.tp_size == 0
-            and share_tp_topology
-        )
-        share_tp_layout = False
-        share_replicated_mqa = False
+        fallback_reason = None
+        if requested_store_tp_size is None:
+            fallback_reason = "invalid Store TP configuration"
+        elif store_layout_cls is None:
+            fallback_reason = f"unsupported KV cache layout {cache_layout}"
+        elif self.pcp_size != 1 or self.dcp_size != 1:
+            fallback_reason = "PCP or DCP is enabled"
+        elif str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == (
+            "true"
+        ):
+            fallback_reason = "cross-layer KV blocks are enabled"
+        elif (
+            requested_store_tp_size < self.tp_size
+            or requested_store_tp_size % self.tp_size
+        ):
+            fallback_reason = "Store TP is not divisible by local TP"
+        valid_tp_mapping = fallback_reason is None
+        store_group_plans: list[_StoreGroupPlan] = []
         if valid_tp_mapping:
             assert requested_store_tp_size is not None
-            attention_layout_supported = (
-                self.num_kv_head == 1 or self.num_kv_head % requested_store_tp_size == 0
-            )
-            mamba_layouts_supported = all(
-                MambaStoreLayout.is_compatible(
-                    spec, self.tp_size, requested_store_tp_size
+            assert store_layout_cls is not None
+            for group_index, (group, replication_factor) in enumerate(
+                zip(
+                    self._kv_cache_groups,
+                    self._group_tp_replication_factors,
+                    strict=True,
                 )
-                for spec in mamba_specs
-            )
-            replicated_mqa_only = not mamba_specs and self.num_kv_head == 1
-            share_tp_layout = (
-                attention_layout_supported
-                and mamba_layouts_supported
-                and not replicated_mqa_only
-            )
-            share_replicated_mqa = attention_layout_supported and replicated_mqa_only
+            ):
+                plan = self._make_store_group_plan(
+                    group,
+                    requested_store_tp_size,
+                    store_layout_cls,
+                    replication_factor,
+                )
+                if plan is None:
+                    fallback_reason = (
+                        f"cache group {group_index} has incompatible Store geometry"
+                    )
+                    store_group_plans.clear()
+                    break
+                store_group_plans.append(plan)
+        share_tp_layout = len(store_group_plans) == len(self._kv_cache_groups)
         self.store_tp_size = requested_store_tp_size if share_tp_layout else None
         store_namespace = ""
-        if share_tp_layout:
-            assert store_layout_cls is not None
-            assert requested_store_tp_size is not None
-            assert cache_layout is not None
-            store_format = (
-                f"tp_shared_hybrid_{cache_layout.name.lower()}"
-                if mamba_specs
-                else store_layout_cls.store_format
-            )
-            store_namespace = (
-                f"@store_tp:{requested_store_tp_size}@store_pp:{self.pp_size}"
-                f"@store_format:{store_format}"
-            )
-        elif share_replicated_mqa:
-            store_namespace = f"@store_pp:{self.pp_size}@store_format:tp_shared_mqa"
-            logger.info(
-                "Mooncake heterogeneous-TP store sharing uses the replicated "
-                "MQA layout for store_tp_size=%d",
-                requested_store_tp_size,
-            )
-        elif store_tp_requested:
+        if store_tp_requested and not share_tp_layout:
             store_namespace = (
                 f"@store_pp:{self.pp_size}@store_format:"
                 f"rank_local_tp{self.tp_size}_layout_"
@@ -1706,9 +1723,11 @@ class MooncakeStoreWorker:
                 else extra_config.get("store_tp_size")
             )
             logger.warning(
-                "Store TP configuration %r with KV layout %s uses namespace %s",
+                "Store TP configuration %r with KV layout %s falls back because %s; "
+                "using namespace %s",
                 requested_topology,
                 cache_layout,
+                fallback_reason,
                 store_namespace,
             )
         metadata = KeyMetadata(
@@ -1724,41 +1743,46 @@ class MooncakeStoreWorker:
             ),
             store_namespace=store_namespace,
         )
-        self._group_tp_replication_factors: tuple[int, ...] = (
-            self._compute_group_tp_replication_factors()
-        )
         if self.store_tp_size is not None:
-            assert store_layout_cls is not None
+            assert requested_store_tp_size is not None
             self.token_dbs = []
-            for g_idx, group in enumerate(self._kv_cache_groups):
+            for g_idx, (group, plan) in enumerate(
+                zip(self._kv_cache_groups, store_group_plans, strict=True)
+            ):
                 spec = group.kv_cache_spec
-                group_metadata = dataclasses.replace(metadata, group_id=g_idx)
-                store_layout: StoreLayout
-                if type(spec) is FullAttentionSpec and self.num_kv_head == 1:
-                    group_metadata = dataclasses.replace(group_metadata, tp_rank=0)
-                    store_layout = RankLocalStoreLayout(
-                        group_metadata, spec.block_size, self.hash_block_size
+                group_namespace = (
+                    f"@store_tp:{requested_store_tp_size}@store_pp:{self.pp_size}"
+                    f"@store_format:{plan.layout_cls.store_format}"
+                    f"@store_schema:{plan.schema_fingerprint}"
+                )
+                group_metadata = dataclasses.replace(
+                    metadata,
+                    group_id=g_idx,
+                    tp_rank=plan.tp_rank,
+                    store_namespace=group_namespace,
+                )
+                if issubclass(plan.layout_cls, AttentionStoreLayout):
+                    attention_layout_cls = cast(
+                        type[AttentionStoreLayout], plan.layout_cls
                     )
-                elif type(spec) is FullAttentionSpec:
-                    store_layout = store_layout_cls(
+                    store_layout: StoreLayout = attention_layout_cls(
                         group_metadata,
                         spec.block_size,
                         self.hash_block_size,
-                        local_tp_size=self.tp_size,
-                        store_tp_size=self.store_tp_size,
-                        tp_rank=self.tp_rank,
-                        num_kv_heads=self.num_kv_head,
+                        local_tp_size=plan.local_tp_size,
+                        store_tp_size=plan.store_shard_count,
+                        tp_rank=plan.tp_rank,
+                        layer_specs=cast(tuple[AttentionSpec, ...], plan.layer_specs),
                     )
                 else:
-                    assert type(spec) is MambaSpec
                     store_layout = MambaStoreLayout(
                         group_metadata,
                         spec.block_size,
                         self.hash_block_size,
-                        local_tp_size=self.tp_size,
-                        store_tp_size=self.store_tp_size,
-                        tp_rank=self.tp_rank,
-                        spec=spec,
+                        local_tp_size=plan.local_tp_size,
+                        store_tp_size=plan.store_shard_count,
+                        tp_rank=plan.tp_rank,
+                        layer_specs=cast(tuple[MambaSpec, ...], plan.layer_specs),
                     )
                 self.token_dbs.append(
                     ChunkedTokenDatabase(
@@ -1785,6 +1809,57 @@ class MooncakeStoreWorker:
             ]
         self._init_lookup_key_prefixes()
 
+    def _make_store_group_plan(
+        self,
+        group: KVCacheGroupSpec,
+        requested_store_tp_size: int,
+        attention_layout_cls: type[AttentionStoreLayout],
+        replication_factor: int,
+    ) -> _StoreGroupPlan | None:
+        layer_specs = _group_layer_specs(group)
+        families = {_store_spec_family(spec) for spec in layer_specs}
+        if len(families) != 1 or None in families:
+            return None
+        family = families.pop()
+        assert family is not None
+
+        if family == "attention":
+            attention_specs = cast(tuple[AttentionSpec, ...], layer_specs)
+            if self.tp_size % replication_factor:
+                return None
+            logical_tp_size = self.tp_size // replication_factor
+            store_shard_count = AttentionStoreLayout.resolve_store_shard_count(
+                attention_specs, logical_tp_size, requested_store_tp_size
+            )
+            if store_shard_count is None:
+                return None
+            return _StoreGroupPlan(
+                layer_specs=layer_specs,
+                local_tp_size=logical_tp_size,
+                store_shard_count=store_shard_count,
+                tp_rank=self.tp_rank // replication_factor,
+                layout_cls=attention_layout_cls,
+                schema_fingerprint=AttentionStoreLayout.schema_fingerprint(
+                    attention_specs, logical_tp_size, store_shard_count
+                ),
+            )
+
+        mamba_specs = cast(tuple[MambaSpec, ...], layer_specs)
+        try:
+            schema_fingerprint = MambaStoreLayout.schema_fingerprint(
+                mamba_specs, self.tp_size, requested_store_tp_size
+            )
+        except (AssertionError, IndexError, NotImplementedError, ValueError):
+            return None
+        return _StoreGroupPlan(
+            layer_specs=layer_specs,
+            local_tp_size=self.tp_size,
+            store_shard_count=requested_store_tp_size,
+            tp_rank=self.tp_rank,
+            layout_cls=MambaStoreLayout,
+            schema_fingerprint=schema_fingerprint,
+        )
+
     def _spec_tp_replication_factor(self, spec: KVCacheSpec) -> int:
         if self.dcp_size > 1:
             return 1
@@ -1793,23 +1868,19 @@ class MooncakeStoreWorker:
             if isinstance(spec, UniformTypeKVCacheSpecs)
             else (spec,)
         )
-        # Any rank-specific state makes the whole packed value rank-specific.
         if any(isinstance(inner, MambaSpec) for inner in inner_specs):
             return 1
-        # A pure MLA packed value is replicated on every TP rank.
-        if all(
-            isinstance(inner, (MLAAttentionSpec, SlidingWindowMLASpec))
+        factors = [
+            (
+                self.tp_size
+                if isinstance(inner, (MLAAttentionSpec, SlidingWindowMLASpec))
+                else max(1, self.tp_size // self.num_kv_head)
+            )
             for inner in inner_specs
-        ):
-            return self.tp_size
-        return max(1, self.tp_size // self.num_kv_head)
+        ]
+        return min(factors, default=1)
 
     def _compute_group_tp_replication_factors(self) -> tuple[int, ...]:
-        """Return the number of byte-identical TP replicas per cache group.
-
-        DCP and Mamba use 1; MLA uses ``tp_size``; GQA uses
-        ``tp_size // num_kv_head``.
-        """
         return tuple(
             self._spec_tp_replication_factor(group.kv_cache_spec)
             for group in self._kv_cache_groups

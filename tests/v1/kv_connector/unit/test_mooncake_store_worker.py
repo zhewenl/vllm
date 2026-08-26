@@ -1334,7 +1334,7 @@ def test_stale_store_job_cannot_touch_a_reused_request_id():
     stale = _make_store_req("req-a", [b"a0", b"a1"])
     stale.store_job_id = 1
     thread.add_request(stale)
-    thread._record_saved(stale, 32)
+    thread._record_group_saved_offsets(stale, [32])
     thread.delete_finished_stored_request("req-a")
 
     live = _make_store_req("req-a", [b"a0", b"a1"])
@@ -1343,7 +1343,7 @@ def test_stale_store_job_cannot_touch_a_reused_request_id():
     thread._retry_token_ids["req-a"] = (32, list(range(32, 64)))
 
     thread.finish_store_job(stale)
-    thread._record_saved(stale, 64)
+    thread._record_group_saved_offsets(stale, [64])
     thread._mark_request_skipped_for_pressure(stale)
     thread._update_retry_token_ids(stale, False, 0, list(range(32)))
     thread._update_retry_token_ids(stale, True, 0, None)
@@ -2146,7 +2146,7 @@ def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(tmp_path, monke
         assert store_worker.store_tp_size == 4
         assert isinstance(store_worker.token_dbs[0].store_layout, LBHNCStoreLayout)
         assert isinstance(store_worker.token_dbs[1].store_layout, MambaStoreLayout)
-        assert store_worker.token_dbs[0].chunk_size == 400
+        assert store_worker.token_dbs[0].chunk_size == 16
         assert (
             worker.resolve_store_job_block_size(
                 config,
@@ -2154,7 +2154,7 @@ def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(tmp_path, monke
                 store_worker.block_size,
                 store_worker.hash_block_size,
             )
-            == 400
+            == 16
         )
         assert len(store_worker._lookup_key_prefixes[0]) == 2
         assert len(store_worker._lookup_key_prefixes[1]) == 4
@@ -2194,7 +2194,7 @@ def test_hybrid_gdn_falls_back_when_state_cannot_be_store_sharded(
     )
 
     store_worker = worker.MooncakeStoreWorker(
-        _make_vllm_config(extra_config={"store_tp_size": 8}),
+        _make_vllm_config(extra_config={"store_tp_size": 6}),
         _make_hybrid_gdn_kv_cache_config(tp_size=2),
     )
 
@@ -2828,13 +2828,15 @@ def test_store_sending_thread_publishes_attention_before_hybrid_checkpoint():
     assert len(keys) == 1
     assert "@group:0" in keys[0]
     assert thread._saved_offset["r0"] == 8
+    assert thread._group_saved_offsets["r0"] == [12, 8]
     events = thread.update_kv_event.call_args.args[0]
     assert [(event.group_idx, event.block_size) for event in events] == [(0, 4)]
 
     store.batch_is_exist.side_effect = None
-    store.batch_is_exist.return_value = [1, 0, 0]
+    store.batch_is_exist.return_value = [0, 0]
     store.batch_put_from_multi_buffers.reset_mock()
-    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    store.batch_put_from_multi_buffers.side_effect = None
+    store.batch_put_from_multi_buffers.return_value = [-1, 256]
     thread.update_kv_event.reset_mock()
     _run_store_req(
         thread,
@@ -2852,9 +2854,32 @@ def test_store_sending_thread_publishes_attention_before_hybrid_checkpoint():
     keys = store.batch_put_from_multi_buffers.call_args.args[0]
     assert len(keys) == 2
     assert {"@group:0" in key for key in keys} == {False, True}
-    assert thread._saved_offset["r0"] == 16
+    assert thread._group_saved_offsets["r0"] == [12, 16]
+    assert thread._saved_offset["r0"] == 8
     events = thread.update_kv_event.call_args.args[0]
-    assert {event.group_idx for event in events} == {0, 1}
+    assert {event.group_idx for event in events} == {1}
+
+    store.batch_is_exist.return_value = [0]
+    store.batch_put_from_multi_buffers.reset_mock()
+    store.batch_put_from_multi_buffers.return_value = [256]
+    thread.update_kv_event.reset_mock()
+    _run_store_req(
+        thread,
+        ReqMeta(
+            req_id="r0",
+            token_len_chunk=16,
+            block_ids=([1, 2, 3], [4, 5, 6]),
+            block_hashes=[b"a0", b"a1", b"a2", b"a3"],
+            can_save=True,
+            token_ids=list(range(8, 16)),
+            token_ids_start=8,
+        ),
+    )
+    keys = store.batch_put_from_multi_buffers.call_args.args[0]
+    assert len(keys) == 1
+    assert "@group:0" in keys[0]
+    assert thread._group_saved_offsets["r0"] == [16, 16]
+    assert thread._saved_offset["r0"] == 16
 
 
 def test_store_sending_thread_skips_when_token_len_below_lcm():
@@ -3275,6 +3300,7 @@ def _make_bare_worker(
     worker.finished_store_req = set()
     worker.tp_size = 1
     worker.store_tp_size = None
+    worker.requested_store_chunk_size = None
     worker.num_kv_head = 1
     worker.pp_size = 1
     # Minimal single-full-attention-group config so the coordinator-based

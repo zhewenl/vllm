@@ -180,17 +180,30 @@ four head-major layouts to one Store value order and the two token-major
 layouts to another. Physical layouts with the same value order can share
 entries.
 
-For hybrid cache allocations, the connector derives a stable attention Store
-chunk size from the common Store TP. A local attention block may contain
-several Store chunks, which are read and written through tensor-offset
-descriptors. Completed attention chunks can be stored before the next hybrid
-prefix boundary. Mamba and GDN entries remain complete state snapshots at
-their reusable prefix boundaries, and lookup exposes a prefix after all cache
-groups required at that boundary are present.
+For hybrid cache allocations, a local attention block may contain several Store
+chunks, which are read and written through tensor-offset descriptors. By
+default, their size is a TP-independent page alignment: 128 tokens for MLA
+hybrid models and the default 16-token KV block unit for other hybrid models.
+Models using the `all` Mamba cache mode also include the model's Mamba chunk
+alignment. The same value is used for prefix hashes. A larger
+`store_chunk_size` can reduce Store object and metadata overhead:
 
-Hybrid endpoints whose local block sizes differ must use the same
-`prefix_match_unit`, and it must divide the derived Store chunk size. This
-keeps request hashes and Store chunk keys aligned across TP sizes.
+```json
+{
+    "kv_connector_extra_config": {
+        "store_tp_size": 8,
+        "store_chunk_size": 512
+    }
+}
+```
+
+The configured size applies to Attention Store objects and participates in
+hybrid page alignment. Unless a finer `prefix_match_unit` is configured, it is
+also the prefix-hash granularity. It must align with each layer's stored states.
+Completed Attention chunks can be stored before the next hybrid prefix
+boundary. Mamba and GDN entries remain complete state snapshots at their
+reusable prefix boundaries, and lookup exposes a prefix after all cache groups
+required at that boundary are present.
 
 Attention groups are planned from their per-layer cache specs, including specs
 wrapped by `UniformTypeKVCacheSpecs`. The Store TP and global head-slot count

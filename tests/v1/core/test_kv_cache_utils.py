@@ -2310,6 +2310,52 @@ def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     ) == (544, 136)
 
 
+@pytest.mark.parametrize(
+    ("use_mla", "extra_config", "block_size", "expected_hash_block_size"),
+    [
+        (False, {"store_tp_size": 4}, 784, 16),
+        (True, {"store_tp_size": 4}, 1536, 128),
+        (True, {"store_tp_size": 4, "store_chunk_size": 512}, 1536, 512),
+    ],
+)
+def test_heterogeneous_store_resolves_common_hash_granularity(
+    use_mla, extra_config, block_size, expected_hash_block_size
+):
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["model.attn"], new_kv_cache_spec(block_size=block_size)),
+            KVCacheGroupSpec(
+                ["model.mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=((1,),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16,
+            enable_prefix_caching=True,
+            prefix_match_unit=None,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MooncakeStoreConnector",
+            kv_connector_extra_config=extra_config,
+        ),
+        model_config=SimpleNamespace(use_mla=use_mla),
+    )
+
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    ) == (block_size, expected_hash_block_size)
+
+
 def test_multi_run_layer_compact_strides_place_hoisted_heads():
     """A layer-compact run region is its own dense allocation: under LHBNC the head
     groups sit between the layers and the blocks, so a run's block stride is one head

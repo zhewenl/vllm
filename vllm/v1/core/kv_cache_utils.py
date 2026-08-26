@@ -14,6 +14,7 @@ from typing import Any, NamedTuple, NewType, TypeAlias, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.config.cache import CacheConfig
 from vllm.logger import init_logger
 from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
@@ -647,6 +648,37 @@ def hash_block_tokens(
     )
 
 
+def _resolve_heterogeneous_store_prefix_match_unit(
+    vllm_config: VllmConfig,
+) -> int | None:
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if (
+        kv_transfer_config is None
+        or getattr(kv_transfer_config, "kv_connector", None)
+        != "MooncakeStoreConnector"
+    ):
+        return None
+
+    extra_config = kv_transfer_config.kv_connector_extra_config
+    heterogeneous_store = extra_config.get("enable_store_tp_lcm") is True or (
+        type(extra_config.get("store_tp_size")) is int
+        and extra_config["store_tp_size"] > 0
+    )
+    if not heterogeneous_store:
+        return None
+
+    requested = extra_config.get("store_chunk_size")
+    if requested is not None:
+        if type(requested) is not int or requested <= 0:
+            raise ValueError("store_chunk_size must be a positive integer")
+        return requested
+    return (
+        128
+        if vllm_config.model_config.use_mla
+        else CacheConfig.DEFAULT_BLOCK_SIZE
+    )
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -660,8 +692,9 @@ def resolve_kv_cache_block_sizes(
       Mamba groups keep their full per-rank state and are not scaled.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
-      ``cache_config.prefix_match_unit`` override if set, else the GCD of
-      group block sizes; every group's block size must be divisible by it.
+      ``cache_config.prefix_match_unit`` override if set, the common Store
+      chunk for heterogeneous Mooncake Store, or the GCD of group block sizes;
+      every group's block size must be divisible by it.
       Returns the scheduler block size (i.e. disables finer hashing) if block
       hashing is inactive or a mamba group is not using cache mode "align".
     """
@@ -699,6 +732,8 @@ def resolve_kv_cache_block_sizes(
         return scheduler_block_size, scheduler_block_size
 
     requested = cache_config.prefix_match_unit
+    if requested is None:
+        requested = _resolve_heterogeneous_store_prefix_match_unit(vllm_config)
     hash_block_size = (
         requested if requested is not None else math.gcd(*group_block_sizes)
     )

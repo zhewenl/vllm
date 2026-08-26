@@ -522,36 +522,20 @@ class AttentionStoreLayout(TPShardedStoreLayout):
     @staticmethod
     def resolve_store_chunk_size(
         layer_specs: Sequence[AttentionSpec],
-        local_tp_size: int,
-        physical_tp_size: int,
-        requested_store_tp_size: int,
-        store_shard_count: int,
-        normalize_hybrid_chunks: bool,
+        requested_store_chunk_size: int | None = None,
     ) -> int | None:
-        if not normalize_hybrid_chunks:
-            block_sizes = {spec.block_size for spec in layer_specs}
-            return block_sizes.pop() if len(block_sizes) == 1 else None
+        if requested_store_chunk_size is not None:
+            for spec in layer_specs:
+                states = Fraction(requested_store_chunk_size, 1) / spec.tokens_per_state
+                if (
+                    spec.block_size % requested_store_chunk_size
+                    or states.denominator != 1
+                ):
+                    return None
+            return requested_store_chunk_size
 
-        global_head_slots = layer_specs[0].num_heads * local_tp_size
-        heads_per_store_shard = global_head_slots // store_shard_count
-        store_chunk_sizes: set[int] = set()
-        for spec in layer_specs:
-            # Normalize the local page to the state count held by one Store
-            # shard. The result must map to whole states and tokens.
-            store_states = Fraction(
-                spec.get_num_kernel_states(spec.block_size)
-                * spec.num_heads
-                * physical_tp_size,
-                requested_store_tp_size * heads_per_store_shard,
-            )
-            store_tokens = store_states * spec.tokens_per_state
-            if store_states.denominator != 1 or store_tokens.denominator != 1:
-                return None
-            store_chunk_size = store_tokens.numerator
-            if store_chunk_size <= 0 or spec.block_size % store_chunk_size:
-                return None
-            store_chunk_sizes.add(store_chunk_size)
-        return store_chunk_sizes.pop() if len(store_chunk_sizes) == 1 else None
+        block_sizes = {spec.block_size for spec in layer_specs}
+        return block_sizes.pop() if len(block_sizes) == 1 else None
 
     @staticmethod
     def schema_fingerprint(

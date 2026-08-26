@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    AttentionStoreLayout,
     BHLNCStoreLayout,
     BLHNCStoreLayout,
     BLNHCStoreLayout,
@@ -486,6 +487,29 @@ def test_attention_store_layout_round_trip_across_local_block_sizes(
             ctypes.memmove(addr, value[offset : offset + size], size)
             offset += size
     torch.testing.assert_close(restored_small, small_cache)
+
+
+def test_attention_store_chunk_is_independent_of_k3_local_pages():
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    fingerprints = set()
+    for block_size in (1536, 11776):
+        spec = MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        chunk_size = AttentionStoreLayout.resolve_store_chunk_size(
+            (spec,),
+            requested_store_chunk_size=512,
+        )
+        assert chunk_size == 512
+        fingerprints.add(
+            AttentionStoreLayout.schema_fingerprint((spec,), 1, 1, chunk_size)
+        )
+
+    assert len(fingerprints) == 1
 
 
 def test_tp_shared_layout_handles_kernel_blocked_compressed_states():

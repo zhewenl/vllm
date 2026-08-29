@@ -3,6 +3,7 @@
 """Tests for Mooncake Store payload layouts."""
 
 import ctypes
+import os
 import random
 
 import pytest
@@ -21,11 +22,19 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     MambaStoreLayout,
     RankLocalStoreLayout,
 )
+from vllm.model_executor.layers.mamba.mamba_utils import get_conv_state_layout
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 BLOCK_SIZE = 128
+
+
+@pytest.fixture(autouse=True)
+def _reset_conv_state_layout_cache():
+    get_conv_state_layout.cache_clear()
+    yield
+    get_conv_state_layout.cache_clear()
 
 
 def _attention_specs(
@@ -79,9 +88,12 @@ def _make_gdn_store_layout(
     from vllm.v1.kv_cache_interface import MambaSpec
 
     local_factor = 4 // local_tp_size
+    conv_shape = (6 * local_factor, 3)
+    if os.environ.get("VLLM_SSM_CONV_STATE_LAYOUT") == "SD":
+        conv_shape = conv_shape[::-1]
     spec = MambaSpec(
         block_size=16,
-        shapes=((6 * local_factor, 3), (local_factor, 2, 2)),
+        shapes=(conv_shape, (local_factor, 2, 2)),
         dtypes=(torch.uint8, torch.uint8),
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
     )
@@ -96,10 +108,13 @@ def _make_mamba2_store_layout(
 
     local_heads = 4 // local_tp_size
     effective_groups = local_tp_size
+    conv_shape = ((8 + 2 * effective_groups * 2) // local_tp_size, 3)
+    if os.environ.get("VLLM_SSM_CONV_STATE_LAYOUT") == "SD":
+        conv_shape = conv_shape[::-1]
     spec = MambaSpec(
         block_size=16,
         shapes=(
-            ((8 + 2 * effective_groups * 2) // local_tp_size, 3),
+            conv_shape,
             (local_heads, 2, 2),
         ),
         dtypes=(torch.uint8, torch.uint8),
@@ -186,26 +201,44 @@ def _assert_state_store_round_trip(layout_factory):
         assert len(schemas) == 1
 
 
-def test_gdn_store_shards_round_trip_in_both_tp_directions(monkeypatch):
-    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+@pytest.mark.parametrize("conv_layout", ["DS", "SD"])
+def test_gdn_store_shards_round_trip_in_both_tp_directions(monkeypatch, conv_layout):
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", conv_layout)
     _assert_state_store_round_trip(_make_gdn_store_layout)
 
 
-def test_mamba2_replicated_groups_round_trip_in_both_tp_directions(monkeypatch):
-    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+@pytest.mark.parametrize("conv_layout", ["DS", "SD"])
+def test_mamba2_replicated_groups_round_trip_in_both_tp_directions(
+    monkeypatch, conv_layout
+):
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", conv_layout)
     _assert_state_store_round_trip(_make_mamba2_store_layout)
 
 
-def test_gdn_store_shard_segments_preserve_projection_boundaries(monkeypatch):
-    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+@pytest.mark.parametrize(
+    ("conv_layout", "sizes", "shard0_offsets", "shard1_offsets"),
+    [
+        ("DS", [6, 6, 6, 4], [0, 12, 24, 36], [6, 18, 30, 40]),
+        (
+            "SD",
+            [2] * 9 + [4],
+            [0, 4, 8, 12, 16, 20, 24, 28, 32, 36],
+            [2, 6, 10, 14, 18, 22, 26, 30, 34, 40],
+        ),
+    ],
+)
+def test_gdn_store_shard_segments_preserve_projection_boundaries(
+    monkeypatch, conv_layout, sizes, shard0_offsets, shard1_offsets
+):
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", conv_layout)
     layout, cache = _make_gdn_store_layout(local_tp_size=2, tp_rank=0)
 
-    shard0_addrs, sizes = _descriptors_for_block(layout, 0)
+    shard0_addrs, shard0_sizes = _descriptors_for_block(layout, 0)
     shard1_addrs, shard1_sizes = _descriptors_for_block(layout, 1)
 
-    assert sizes == shard1_sizes == [6, 6, 6, 4]
-    assert [addr - cache.data_ptr() for addr in shard0_addrs] == [0, 12, 24, 36]
-    assert [addr - cache.data_ptr() for addr in shard1_addrs] == [6, 18, 30, 40]
+    assert shard0_sizes == shard1_sizes == sizes
+    assert [addr - cache.data_ptr() for addr in shard0_addrs] == shard0_offsets
+    assert [addr - cache.data_ptr() for addr in shard1_addrs] == shard1_offsets
 
 
 def _rank_local_layout(num_regions: int, num_block_lens: int) -> RankLocalStoreLayout:

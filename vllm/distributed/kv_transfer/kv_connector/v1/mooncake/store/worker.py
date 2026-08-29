@@ -83,6 +83,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -239,6 +240,7 @@ def resolve_store_job_block_size(
     groups = kv_cache_config.kv_cache_groups
     if (
         requested_store_tp_size is None
+        or (len(groups) > 1 and vllm_config.cache_config.prefix_match_unit is None)
         or (
             extra_config.get("store_chunk_size") is not None
             and requested_store_chunk_size is None
@@ -1010,7 +1012,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         sub_block: list[tuple[int, int, int]] = []
         for group_id, block_id, boundary in offloads:
             entry = (group_id, block_id, boundary)
-            if boundary % self.token_databases[group_id].block_size == 0:
+            if boundary % self.token_databases[group_id].store_layout.block_size == 0:
                 snapshots.append(entry)
             else:
                 sub_block.append(entry)
@@ -1965,6 +1967,14 @@ class MooncakeStoreWorker:
         requested_store_tp_size = resolve_store_tp_size(extra_config)
         store_chunk_requested = extra_config.get("store_chunk_size") is not None
         self.requested_store_chunk_size = resolve_store_chunk_size(extra_config)
+        hybrid_store_requested = store_tp_requested and len(self._kv_cache_groups) > 1
+        prefix_match_unit = self.cache_config.prefix_match_unit
+        if (
+            hybrid_store_requested
+            and prefix_match_unit is not None
+            and not store_chunk_requested
+        ):
+            self.requested_store_chunk_size = prefix_match_unit
         cache_layout = (
             self.cache_config.get_resolved_kv_cache_layout()
             if store_tp_requested
@@ -1983,8 +1993,16 @@ class MooncakeStoreWorker:
         fallback_reason = None
         if requested_store_tp_size is None:
             fallback_reason = "invalid Store TP configuration"
+        elif hybrid_store_requested and prefix_match_unit is None:
+            fallback_reason = "Hybrid Store TP sharing requires prefix_match_unit"
         elif store_chunk_requested and self.requested_store_chunk_size is None:
             fallback_reason = "invalid Store chunk size"
+        elif (
+            hybrid_store_requested
+            and self.requested_store_chunk_size is not None
+            and self.requested_store_chunk_size % self.hash_block_size
+        ):
+            fallback_reason = "Store chunk size is not aligned to prefix_match_unit"
         elif store_layout_cls is None:
             fallback_reason = f"unsupported KV cache layout {cache_layout}"
         elif self.pcp_size != 1 or self.dcp_size != 1:

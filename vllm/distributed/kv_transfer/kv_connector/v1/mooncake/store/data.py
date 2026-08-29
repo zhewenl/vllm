@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
     derive_mamba_conv_split,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import is_non_overlapping_and_dense
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -800,14 +801,42 @@ class MambaStoreLayout(TPShardedStoreLayout):
     def _state_segments(
         spec: MambaSpec, local_tp_size: int, shards_per_rank: int
     ) -> tuple[tuple[int, int, int], ...]:
-        conv = derive_mamba_conv_split(spec, local_tp_size)
-        row_bytes = conv.conv_rows * conv.conv_dtype_size
+        conv = derive_mamba_conv_split(spec, local_tp_size, require_dim_first=False)
         segments = []
-        for proj_index, (offset, size) in enumerate(conv.local_conv_offsets):
-            unit_size = row_bytes
-            if spec.mamba_type == MambaAttentionBackendEnum.MAMBA2 and proj_index > 0:
-                unit_size *= spec.shapes[1][-1]
-            segments.append((offset, size, unit_size))
+        if is_conv_state_dim_first():
+            row_bytes = conv.conv_rows * conv.conv_dtype_size
+            for proj_index, (offset, size) in enumerate(conv.local_conv_offsets):
+                unit_size = row_bytes
+                if (
+                    spec.mamba_type == MambaAttentionBackendEnum.MAMBA2
+                    and proj_index > 0
+                ):
+                    unit_size *= spec.shapes[1][-1]
+                segments.append((offset, size, unit_size))
+        else:
+            proj_offsets = []
+            offset = 0
+            for proj_dim in conv.local_proj_dims:
+                proj_offsets.append(offset)
+                offset += proj_dim
+            for row_index in range(conv.conv_rows):
+                row_offset = row_index * conv.local_conv_dim
+                for proj_index, (proj_offset, proj_dim) in enumerate(
+                    zip(proj_offsets, conv.local_proj_dims, strict=True)
+                ):
+                    unit_size = conv.conv_dtype_size
+                    if (
+                        spec.mamba_type == MambaAttentionBackendEnum.MAMBA2
+                        and proj_index > 0
+                    ):
+                        unit_size *= spec.shapes[1][-1]
+                    segments.append(
+                        (
+                            (row_offset + proj_offset) * conv.conv_dtype_size,
+                            proj_dim * conv.conv_dtype_size,
+                            unit_size,
+                        )
+                    )
         state_offset = conv.ssm_sizes[0]
         for state_index, shape in enumerate(spec.shapes[1:], start=1):
             state_dtype: torch.dtype = spec.dtypes[state_index]
@@ -858,6 +887,7 @@ class MambaStoreLayout(TPShardedStoreLayout):
                 ),
                 tuple(str(dtype) for dtype in spec.dtypes),
                 str(spec.mamba_type),
+                "DS" if is_conv_state_dim_first() else "SD",
             )
             for spec in layer_specs
         )

@@ -775,7 +775,6 @@ class Platform:
         """
         from math import lcm
 
-        from vllm.config.cache import CacheConfig
         from vllm.config.vllm import set_current_vllm_config
         from vllm.model_executor.models import ModelRegistry
         from vllm.utils.math_utils import cdiv
@@ -888,34 +887,6 @@ class Platform:
                 # multiple of 128 so split kernel blocks keep that invariant.
                 kernel_block_alignment_size = max(kernel_block_alignment_size, 128)
 
-        common_store_unit = (
-            128 if model_config.use_mla else CacheConfig.DEFAULT_BLOCK_SIZE
-        )
-
-        kv_transfer_config = vllm_config.kv_transfer_config
-        extra_config = (
-            kv_transfer_config.kv_connector_extra_config
-            if kv_transfer_config is not None
-            else {}
-        )
-        heterogeneous_store = kv_transfer_config is not None and (
-            kv_transfer_config.kv_connector == "MooncakeStoreConnector"
-            and (
-                extra_config.get("enable_store_tp_lcm") is True
-                or (
-                    type(extra_config.get("store_tp_size")) is int
-                    and extra_config["store_tp_size"] > 0
-                )
-            )
-        )
-        requested_store_chunk_size = (
-            extra_config.get("store_chunk_size") if heterogeneous_store else None
-        )
-        if not (
-            type(requested_store_chunk_size) is int and requested_store_chunk_size > 0
-        ):
-            requested_store_chunk_size = None
-
         if cache_config.mamba_cache_mode == "all":
             # With prefix caching, align to mamba chunk size for kernel perf
             # TODO(tdoublep): this constraint can be relaxed fairly
@@ -925,36 +896,14 @@ class Platform:
             assert base_chunk_size is not None
             attn_tokens_per_mamba_state = cdiv(mamba_page_size, attn_page_size_1_token)
             chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)
-            common_store_unit = lcm(base_chunk_size, common_store_unit)
-            page_alignment = (
-                lcm(chunk_size, common_store_unit, requested_store_chunk_size)
-                if requested_store_chunk_size is not None
-                else lcm(chunk_size, common_store_unit)
-            )
-            attn_block_size = page_alignment * cdiv(
-                attn_tokens_per_mamba_state, page_alignment
-            )
+            attn_block_size = chunk_size * cdiv(attn_tokens_per_mamba_state, chunk_size)
             cache_config.mamba_block_size = attn_block_size
         else:
             # Without prefix caching, use minimum block size that satisfies
             # both backend alignment and mamba page size compatibility
-            page_alignment = (
-                lcm(
-                    kernel_block_alignment_size,
-                    common_store_unit,
-                    requested_store_chunk_size,
-                )
-                if requested_store_chunk_size is not None
-                else lcm(kernel_block_alignment_size, common_store_unit)
-            )
-            attn_block_size = page_alignment * cdiv(
+            attn_block_size = kernel_block_alignment_size * cdiv(
                 mamba_page_size,
-                page_alignment * attn_page_size_1_token,
-            )
-
-        if heterogeneous_store and cache_config.prefix_match_unit is None:
-            cache_config.prefix_match_unit = (
-                requested_store_chunk_size or common_store_unit
+                kernel_block_alignment_size * attn_page_size_1_token,
             )
 
         if cache_config.block_size < attn_block_size:

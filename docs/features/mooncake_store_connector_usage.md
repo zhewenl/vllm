@@ -181,12 +181,11 @@ layouts to another. Physical layouts with the same value order can share
 entries.
 
 For hybrid cache allocations, a local attention block may contain several Store
-chunks, which are read and written through tensor-offset descriptors. By
-default, their size is a TP-independent page alignment: 128 tokens for MLA
-hybrid models and the default 16-token KV block unit for other hybrid models.
-Models using the `all` Mamba cache mode also include the model's Mamba chunk
-alignment. The same value is used for prefix hashes. A larger
-`store_chunk_size` can reduce Store object and metadata overhead:
+chunks, which are read and written through tensor-offset descriptors. Hybrid
+heterogeneous-TP sharing requires the same explicit `--prefix-match-unit` on
+every endpoint. The connector uses this prefix-hash boundary as the default
+Attention Store chunk size. A larger `store_chunk_size` can reduce Store object
+and metadata overhead:
 
 ```json
 {
@@ -197,9 +196,10 @@ alignment. The same value is used for prefix hashes. A larger
 }
 ```
 
-The configured size applies to Attention Store objects and participates in
-hybrid page alignment. Unless a finer `prefix_match_unit` is configured, it is
-also the prefix-hash granularity. It must align with each layer's stored states.
+The configured size applies to Attention Store objects. It must be a multiple
+of `prefix_match_unit`, divide every local Attention page, and align with each
+layer's stored states. Mamba and GDN convolution state layouts `DS` and `SD`
+are supported; sharing endpoints use the same layout.
 Completed Attention chunks can be stored before the next hybrid prefix
 boundary. Mamba and GDN entries remain complete state snapshots at their
 reusable prefix boundaries, and lookup exposes a prefix after all cache groups

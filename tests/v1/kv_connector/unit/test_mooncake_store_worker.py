@@ -49,6 +49,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
 )
+from vllm.model_executor.layers.mamba.mamba_utils import get_conv_state_layout
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
 from vllm.v1.kv_cache_interface import (
@@ -56,6 +57,14 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
+
+
+@pytest.fixture(autouse=True)
+def _reset_conv_state_layout_cache():
+    get_conv_state_layout.cache_clear()
+    yield
+    get_conv_state_layout.cache_clear()
+
 
 _TP_SHARED_NAMESPACE = (
     "@store_tp:4@store_pp:1@store_format:attention_head_major@store_schema:test"
@@ -354,12 +363,13 @@ def _make_vllm_config(
     pipeline_parallel_size: int = 1,
     tensor_parallel_size: int = 1,
     kv_cache_layout: KVCacheLayout = KVCacheLayout.LBHNC,
+    prefix_match_unit: int | None = None,
 ) -> SimpleNamespace:
     cache_config = SimpleNamespace(
         block_size=16,
         num_gpu_blocks=10,
         enable_prefix_caching=True,
-        prefix_match_unit=None,
+        prefix_match_unit=prefix_match_unit,
     )
     cache_config.get_resolved_kv_cache_layout = lambda: kv_cache_layout
     return SimpleNamespace(
@@ -404,7 +414,7 @@ def _make_kv_cache_config(
     )
 
 
-def _make_hybrid_gdn_kv_cache_config(tp_size: int) -> object:
+def _make_hybrid_gdn_kv_cache_config(tp_size: int, conv_layout: str = "DS") -> object:
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
@@ -415,9 +425,12 @@ def _make_hybrid_gdn_kv_cache_config(tp_size: int) -> object:
         dtype=None,
     )
     local_factor = 4 // tp_size
+    conv_shape = (6 * local_factor, 3)
+    if conv_layout == "SD":
+        conv_shape = conv_shape[::-1]
     gdn = MambaSpec(
         block_size=16,
-        shapes=((6 * local_factor, 3), (local_factor, 2, 2)),
+        shapes=(conv_shape, (local_factor, 2, 2)),
         dtypes=(torch.uint8, torch.uint8),
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
         mamba_cache_mode="align",
@@ -998,22 +1011,19 @@ def test_partial_tail_offload_skips_null_source_blocks():
 
 def test_partial_tail_offload_writes_each_local_store_shard():
     store = MagicMock()
-    store.batch_is_exist.return_value = [0, 0]
-    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
     db, _ = _make_tp_shared_db()
-    coord = SimpleNamespace(
-        enable_partial_hash_hits=True,
-        hash_block_size=4,
-        lcm_block_size=16,
-    )
-    thread = _make_store_sending_thread(store, coord=coord, token_databases=[db])
+    thread = _make_partial_tail_send_thread(store)
+    thread.token_databases[0] = db
 
-    assert thread._maybe_offload_partial_tail(_make_partial_tail_req([1]))
+    assert thread._maybe_offload_boundary_states(_make_partial_tail_req([1]))
 
     keys = store.batch_put_from_multi_buffers.call_args.args[0]
-    assert len(keys) == 2
-    assert "@tp_rank:0" in keys[0]
-    assert "@tp_rank:1" in keys[1]
+    attention_keys = [key for key in keys if "@group:0" in key]
+    assert len(attention_keys) == 2
+    assert "@tp_rank:0" in attention_keys[0]
+    assert "@tp_rank:1" in attention_keys[1]
 
 
 def test_store_sending_thread_skips_null_sparse_group_blocks():
@@ -2387,12 +2397,15 @@ def test_worker_enables_store_tp_layout(
     assert len(w._lookup_key_prefixes[0]) == 4
 
 
-def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(tmp_path, monkeypatch):
+@pytest.mark.parametrize("conv_layout", ["DS", "SD"])
+def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(
+    tmp_path, monkeypatch, conv_layout
+):
     store = MagicMock()
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
     monkeypatch.setattr(_FakeModelConfig, "get_total_num_kv_heads", lambda _self: 2)
-    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", conv_layout)
     monkeypatch.setenv(
         "MOONCAKE_CONFIG_PATH",
         _write_mooncake_config(
@@ -2411,8 +2424,9 @@ def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(tmp_path, monke
         config = _make_vllm_config(
             extra_config={"store_tp_size": 4},
             tensor_parallel_size=tp_size,
+            prefix_match_unit=16,
         )
-        kv_cache_config = _make_hybrid_gdn_kv_cache_config(tp_size)
+        kv_cache_config = _make_hybrid_gdn_kv_cache_config(tp_size, conv_layout)
         store_worker = worker.MooncakeStoreWorker(config, kv_cache_config)
         assert store_worker.store_tp_size == 4
         assert isinstance(store_worker.token_dbs[0].store_layout, LBHNCStoreLayout)
@@ -2443,8 +2457,9 @@ def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(tmp_path, monke
     assert "@store_format:mamba_state" in gdn_key_tp2
 
 
-def test_hybrid_gdn_falls_back_when_state_cannot_be_store_sharded(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(("store_tp_size", "prefix_match_unit"), [(6, 16), (4, None)])
+def test_hybrid_gdn_falls_back_from_incompatible_store_config(
+    tmp_path, monkeypatch, store_tp_size, prefix_match_unit
 ):
     store = MagicMock()
     store.setup.return_value = 0
@@ -2464,10 +2479,16 @@ def test_hybrid_gdn_falls_back_when_state_cannot_be_store_sharded(
         ),
     )
 
-    store_worker = worker.MooncakeStoreWorker(
-        _make_vllm_config(extra_config={"store_tp_size": 6}),
-        _make_hybrid_gdn_kv_cache_config(tp_size=2),
+    config = _make_vllm_config(
+        extra_config={"store_tp_size": store_tp_size},
+        prefix_match_unit=prefix_match_unit,
     )
+    kv_cache_config = _make_hybrid_gdn_kv_cache_config(tp_size=2)
+    if prefix_match_unit is None:
+        assert (
+            worker.resolve_store_job_block_size(config, kv_cache_config, 800, 16) == 800
+        )
+    store_worker = worker.MooncakeStoreWorker(config, kv_cache_config)
 
     assert store_worker.store_tp_size is None
     assert all(

@@ -14,7 +14,6 @@ from typing import Any, NamedTuple, NewType, TypeAlias, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
-from vllm.config.cache import CacheConfig
 from vllm.logger import init_logger
 from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
@@ -36,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     compute_layout_strides,
+    iter_layer_specs,
     replace_as,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -648,35 +648,31 @@ def hash_block_tokens(
     )
 
 
-def _resolve_heterogeneous_store_prefix_match_unit(
-    vllm_config: VllmConfig,
-) -> int | None:
-    kv_transfer_config = vllm_config.kv_transfer_config
-    if (
-        kv_transfer_config is None
-        or getattr(kv_transfer_config, "kv_connector", None)
-        != "MooncakeStoreConnector"
+def resolve_dcp_kv_block_size(spec: KVCacheSpec, dcp_world_size: int) -> int:
+    """Return the token span of a cache block under DCP."""
+    layer_specs = iter_layer_specs(spec)
+    if len(layer_specs) > 0 and all(
+        isinstance(layer_spec, AttentionSpec) for layer_spec in layer_specs
     ):
-        return None
+        return spec.block_size * dcp_world_size
+    return spec.block_size
 
-    extra_config = kv_transfer_config.kv_connector_extra_config
-    heterogeneous_store = extra_config.get("enable_store_tp_lcm") is True or (
-        type(extra_config.get("store_tp_size")) is int
-        and extra_config["store_tp_size"] > 0
-    )
-    if not heterogeneous_store:
-        return None
 
-    requested = extra_config.get("store_chunk_size")
-    if requested is not None:
-        if type(requested) is not int or requested <= 0:
-            raise ValueError("store_chunk_size must be a positive integer")
-        return requested
-    return (
-        128
-        if vllm_config.model_config.use_mla
-        else CacheConfig.DEFAULT_BLOCK_SIZE
-    )
+def resolve_dcp_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> KVCacheSpec:
+    """Return a KV cache spec with block sizes adjusted for DCP."""
+    block_size = resolve_dcp_kv_block_size(spec, dcp_world_size)
+    if block_size == spec.block_size:
+        return spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return replace(
+            spec,
+            block_size=block_size,
+            kv_cache_specs={
+                name: resolve_dcp_kv_cache_spec(layer_spec, dcp_world_size)
+                for name, layer_spec in spec.kv_cache_specs.items()
+            },
+        )
+    return replace(spec, block_size=block_size)
 
 
 def resolve_kv_cache_block_sizes(
@@ -692,9 +688,8 @@ def resolve_kv_cache_block_sizes(
       Mamba groups keep their full per-rank state and are not scaled.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
-      ``cache_config.prefix_match_unit`` override if set, the common Store
-      chunk for heterogeneous Mooncake Store, or the GCD of group block sizes;
-      every group's block size must be divisible by it.
+      ``cache_config.prefix_match_unit`` override if set, else the GCD of
+      group block sizes; every group's block size must be divisible by it.
       Returns the scheduler block size (i.e. disables finer hashing) if block
       hashing is inactive or a mamba group is not using cache mode "align".
     """
@@ -707,10 +702,7 @@ def resolve_kv_cache_block_sizes(
         return bs, bs
 
     group_block_sizes = [
-        g.kv_cache_spec.block_size * dcp
-        if isinstance(g.kv_cache_spec, AttentionSpec)
-        else g.kv_cache_spec.block_size
-        for g in groups
+        resolve_dcp_kv_block_size(g.kv_cache_spec, dcp) for g in groups
     ]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
@@ -732,8 +724,6 @@ def resolve_kv_cache_block_sizes(
         return scheduler_block_size, scheduler_block_size
 
     requested = cache_config.prefix_match_unit
-    if requested is None:
-        requested = _resolve_heterogeneous_store_prefix_match_unit(vllm_config)
     hash_block_size = (
         requested if requested is not None else math.gcd(*group_block_sizes)
     )

@@ -572,6 +572,18 @@ def ple_conv(
     token_indices: torch.Tensor | None = None,
 ) -> None:
     """Add short-convolution output to ``residual`` and update its state."""
+    # The kernels index every per-request/per-token vector as ``ptr + i``, so
+    # they require unit stride. Callers may pass column views of a wider
+    # block table (e.g. ``block_table[:, 0]`` with speculative state slots).
+    state_indices = state_indices.contiguous()
+    if query_start_loc is not None:
+        query_start_loc = query_start_loc.contiguous()
+    if num_accepted_tokens is not None:
+        num_accepted_tokens = num_accepted_tokens.contiguous()
+    if has_initial_states is not None:
+        has_initial_states = has_initial_states.contiguous()
+    if token_indices is not None:
+        token_indices = token_indices.contiguous()
     BLOCK_C = 512
     kernel_spec_query_len = spec_query_len if mode == "spec" else 1
     T, C = inputs.shape

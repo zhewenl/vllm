@@ -1043,6 +1043,25 @@ class _ConvBatchCase:
     dilation: int = 3
     spec_query_len: int = 1
     graph_padding: int = 0
+    # Width of the simulated mamba block table. With speculative decoding the
+    # table has 1 + num_spec columns and the builders hand the kernels
+    # ``block_table[:, 0]``, a strided view; width > 1 exercises that layout.
+    state_table_width: int = 1
+
+
+def _as_state_column(indices: torch.Tensor, width: int) -> torch.Tensor:
+    if width == 1 or indices.numel() < 2:
+        return indices
+    table = torch.full(
+        (indices.numel(), width),
+        NULL_BLOCK_ID,
+        dtype=indices.dtype,
+        device=indices.device,
+    )
+    table[:, 0] = indices
+    column = table[:, 0]
+    assert not column.is_contiguous()
+    return column
 
 
 def _make_conv_metadata(
@@ -1094,6 +1113,10 @@ def _make_conv_metadata(
     if num_prefills > 1:
         non_spec_state_indices[case.num_decodes + 1] = NULL_BLOCK_ID
 
+    spec_state_indices = _as_state_column(spec_state_indices, case.state_table_width)
+    non_spec_state_indices = _as_state_column(
+        non_spec_state_indices, case.state_table_width
+    )
     spec_query_start_loc = torch.tensor(
         [0, *accumulate(case.spec_query_lens)], dtype=torch.int32, device=device
     )
@@ -1200,6 +1223,32 @@ def _make_conv_metadata(
                 spec_query_len=3,
             ),
             id="mixed-varied",
+        ),
+        # Speculative decoding widens the mamba block table to 1 + num_spec
+        # columns; the metadata builders pass column views, so every request
+        # after the first must still resolve to its own state slot.
+        pytest.param(
+            _ConvBatchCase(
+                prefill_query_lens=(42, 42, 42, 42),
+                channels=512,
+                spec_query_len=4,
+                state_table_width=4,
+            ),
+            id="prefill-strided-state-indices",
+        ),
+        pytest.param(
+            _ConvBatchCase(
+                spec_query_lens=(4, 4, 4, 4),
+                num_accepted=(1, 1, 1, 1),
+                channels=512,
+                spec_query_len=4,
+                state_table_width=4,
+            ),
+            id="spec-strided-state-indices",
+        ),
+        pytest.param(
+            _ConvBatchCase(num_decodes=4, channels=512, state_table_width=4),
+            id="decode-strided-state-indices",
         ),
     ],
 )

@@ -168,10 +168,17 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         )
         assert isinstance(metadata, PleShortConvAttentionMetadata)
 
+        # With speculative decoding the mamba block table has 1 + num_spec
+        # columns, so these column views are strided; the PLE kernels index
+        # state slots with unit stride.
         state_indices_d = metadata.state_indices_tensor_d
         if state_indices_d is not None and state_indices_d.dim() > 1:
             state_indices_d = state_indices_d[:, 0]
+        if state_indices_d is not None:
+            state_indices_d = state_indices_d.contiguous()
         state_indices_p = metadata.state_indices_tensor_p
+        if state_indices_p is not None:
+            state_indices_p = state_indices_p.contiguous()
         if metadata.num_prefills == 0:
             assert state_indices_d is not None
             # BaseMambaAttentionMetadataBuilder pads decode state indices into

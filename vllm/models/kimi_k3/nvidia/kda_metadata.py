@@ -268,6 +268,11 @@ class KDACheckpointMetadata:
 
 @dataclass
 class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
+    # Retain the host copy so batch-invariant execution can split the packed
+    # prefill without synchronizing a CUDA tensor once per KDA layer.
+    non_spec_query_start_loc_cpu: torch.Tensor | None = field(
+        default=None, repr=False, compare=False
+    )
     recoverssm_commit: KDARecoverSSMCommitMetadata | None = None
     recoverssm_context: "KDARecoverSSMCommitContext | None" = field(
         default=None, repr=False, compare=False
@@ -718,6 +723,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
+            non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
             recoverssm_commit=recoverssm_commit,
             recoverssm_context=(
                 self._get_recoverssm_context()

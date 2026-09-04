@@ -1152,7 +1152,8 @@ def override_envs_for_invariance():
     os.environ["NCCL_MAX_NCHANNELS"] = "1"
     os.environ["NCCL_PROTO"] = "Simple"
     os.environ["NCCL_ALGO"] = "allreduce:tree"
-    os.environ["NCCL_NTHREADS"] = "1"
+    # NCCL 2.30 on GB300 requires at least two warps.
+    os.environ["NCCL_NTHREADS"] = "64"
     os.environ["NCCL_SOCKET_NTHREADS"] = "1"
 
     # torch.compile settings

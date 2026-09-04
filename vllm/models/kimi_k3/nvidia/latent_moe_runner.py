@@ -12,6 +12,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner, _unpack
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -75,6 +76,7 @@ class LatentMoERunner(MoERunner):
         self.enable_k3_latent_moe_tail_fusion = (
             current_platform.is_cuda()
             and current_platform.is_device_capability_family(100)
+            and not envs.VLLM_BATCH_INVARIANT
         )
         # Overlap the shared-expert all-reduce with the tier-1 up-projection.
         self._shared_ar_events = (torch.cuda.Event(), torch.cuda.Event())
@@ -193,6 +195,12 @@ class LatentMoERunner(MoERunner):
         shared_output: torch.Tensor,
     ) -> LatentTailTier:
         num_tokens = fused_output.shape[0]
+        # Batch invariance requires one arithmetic path for every token count.
+        # The normal 32-token tier boundary changes both projection sharding
+        # and collective/add order, which is mathematically equivalent but not
+        # bitwise equivalent.
+        if envs.VLLM_BATCH_INVARIANT:
+            return LatentTailTier.ALLREDUCE_OVERLAP
         # tier 0
         if self.enable_k3_latent_moe_tail_fusion and (
             0 < num_tokens <= self._k3_latent_moe_tail_op.contract.max_num_tokens
@@ -247,7 +255,10 @@ class LatentMoERunner(MoERunner):
         """
         transform = self.routed_output_transform
         assert transform is not None
-        assert shared_output.size(0) <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+        assert (
+            envs.VLLM_BATCH_INVARIANT
+            or shared_output.size(0) <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+        )
         if transform.norm is not None:
             fused_latent = self.allreduce_norm_latent_out(fused_output, transform.norm)
         else:
@@ -255,13 +266,17 @@ class LatentMoERunner(MoERunner):
 
         # Overlap the shared-expert all-reduce with the up-projection GEMM while
         # the batch is small enough for it to pay off.
-        result, shared_output = maybe_execute_in_parallel(
-            lambda: torch.mm(fused_latent, transform.up_proj.weight.t()),
-            lambda: tensor_model_parallel_all_reduce(shared_output),
-            self._shared_ar_events[0],
-            self._shared_ar_events[1],
-            aux_stream(),
-        )
+        if envs.VLLM_BATCH_INVARIANT:
+            result = linear_batch_invariant(fused_latent, transform.up_proj.weight)
+            shared_output = tensor_model_parallel_all_reduce(shared_output)
+        else:
+            result, shared_output = maybe_execute_in_parallel(
+                lambda: torch.mm(fused_latent, transform.up_proj.weight.t()),
+                lambda: tensor_model_parallel_all_reduce(shared_output),
+                self._shared_ar_events[0],
+                self._shared_ar_events[1],
+                aux_stream(),
+            )
         result.add_(shared_output)
 
         # Output is already fully reduced; this only strips padding.
@@ -296,7 +311,10 @@ class LatentMoERunner(MoERunner):
 
         # hidden_shard += latent @ up_proj_shard.T, accumulated in the GEMM's
         # beta-add epilogue so folding in the shared partial costs no kernel.
-        hidden_shard.addmm_(latent, up_proj_shard.t())
+        if envs.VLLM_BATCH_INVARIANT:
+            hidden_shard.add_(linear_batch_invariant(latent, up_proj_shard))
+        else:
+            hidden_shard.addmm_(latent, up_proj_shard.t())
 
         return self._maybe_reduce_final_output(
             shared_output, trunc_size, output_is_reduced=False
@@ -338,7 +356,6 @@ class LatentMoERunner(MoERunner):
                 hidden_states,
             )
         )
-
         if (
             og_hidden_dim_pre_xform is None
             and self.moe_config.should_defer_moe_finalize(hidden_states.shape[0])
@@ -398,7 +415,10 @@ class LatentMoERunner(MoERunner):
         if self.moe_config.tp_size == 1:
             return norm(hidden_states)
 
-        if flashinfer_trtllm_fused_allreduce_norm is not None:
+        if (
+            flashinfer_trtllm_fused_allreduce_norm is not None
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
             ok, max_token_num = _can_use_flashinfer(
                 hidden_states, self.moe_config.tp_size
             )

@@ -9,6 +9,7 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
@@ -718,6 +719,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if (
             self.decode_conv1d_weight is not None
             and self.decode_norm_weight is not None
+            and not envs.VLLM_BATCH_INVARIANT
             and not has_spec_decode
             and m.num_prefills == 0
             and m.num_decodes > 0
@@ -854,6 +856,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if mixed_qkv_ns is not None:
             assert g1_ns is not None and beta_ns is not None
             if m.num_prefills > 0:
+                assert has_initial_state is not None
+                assert non_spec_query_start_loc is not None
+                assert non_spec_state_indices_tensor is not None
                 q_ns, k_ns, v_ns = mixed_qkv_ns.split(
                     self.local_projection_size, dim=-1
                 )
@@ -865,6 +870,37 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     state: torch.Tensor,
                     weight: torch.Tensor,
                 ) -> torch.Tensor:
+                    if envs.VLLM_BATCH_INVARIANT:
+                        starts_cpu = m.non_spec_query_start_loc_cpu
+                        assert starts_cpu is not None
+                        starts = starts_cpu.tolist()
+                        if len(starts) > 2:
+                            parts = []
+                            for seq_idx, (start, end) in enumerate(
+                                zip(starts[:-1], starts[1:])
+                            ):
+                                local_query_start_loc = (
+                                    non_spec_query_start_loc.new_tensor(
+                                        [0, end - start]
+                                    )
+                                )
+                                part = causal_conv1d_fn(
+                                    x[start:end].transpose(0, 1),
+                                    weight,
+                                    None,
+                                    activation="silu",
+                                    conv_states=state,
+                                    has_initial_state=has_initial_state[
+                                        seq_idx : seq_idx + 1
+                                    ],
+                                    cache_indices=non_spec_state_indices_tensor[
+                                        seq_idx : seq_idx + 1
+                                    ],
+                                    query_start_loc=local_query_start_loc,
+                                    metadata=None,
+                                ).transpose(0, 1)
+                                parts.append(part)
+                            return torch.cat(parts, dim=0)
                     return causal_conv1d_fn(
                         x.transpose(0, 1),
                         weight,
@@ -983,23 +1019,51 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             workspace=workspace,
                         )
                 else:
-                    (
-                        core_attn_out_non_spec,
-                        last_recurrent_state,
-                    ) = chunk_kda_with_fused_gate(
-                        q=q_ns,
-                        k=k_ns,
-                        v=v_ns,
-                        raw_g=g1_ns,
-                        raw_beta=beta_ns,
-                        A_log=self.A_log,
-                        g_bias=self.dt_bias,
-                        lower_bound=self.gate_lower_bound,
-                        initial_state=initial_state,
-                        output_final_state=True,
-                        use_qk_l2norm_in_kernel=True,
-                        cu_seqlens=non_spec_query_start_loc,
-                    )
+                    if envs.VLLM_BATCH_INVARIANT and initial_state.shape[0] > 1:
+                        starts_cpu = m.non_spec_query_start_loc_cpu
+                        assert starts_cpu is not None
+                        starts = starts_cpu.tolist()
+                        out_parts = []
+                        state_parts = []
+                        for seq_idx, (start, end) in enumerate(
+                            zip(starts[:-1], starts[1:])
+                        ):
+                            seq_out, seq_state = chunk_kda_with_fused_gate(
+                                q=q_ns[:, start:end],
+                                k=k_ns[:, start:end],
+                                v=v_ns[:, start:end],
+                                raw_g=g1_ns[:, start:end],
+                                raw_beta=beta_ns[:, start:end],
+                                A_log=self.A_log,
+                                g_bias=self.dt_bias,
+                                lower_bound=self.gate_lower_bound,
+                                initial_state=initial_state[seq_idx : seq_idx + 1],
+                                output_final_state=True,
+                                use_qk_l2norm_in_kernel=True,
+                                cu_seqlens=None,
+                            )
+                            out_parts.append(seq_out)
+                            state_parts.append(seq_state)
+                        core_attn_out_non_spec = torch.cat(out_parts, dim=1)
+                        last_recurrent_state = torch.cat(state_parts, dim=0)
+                    else:
+                        (
+                            core_attn_out_non_spec,
+                            last_recurrent_state,
+                        ) = chunk_kda_with_fused_gate(
+                            q=q_ns,
+                            k=k_ns,
+                            v=v_ns,
+                            raw_g=g1_ns,
+                            raw_beta=beta_ns,
+                            A_log=self.A_log,
+                            g_bias=self.dt_bias,
+                            lower_bound=self.gate_lower_bound,
+                            initial_state=initial_state,
+                            output_final_state=True,
+                            use_qk_l2norm_in_kernel=True,
+                            cu_seqlens=non_spec_query_start_loc,
+                        )
                 recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
             else:
                 # Pure non-speculative decode.
@@ -1007,30 +1071,105 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 decode_conv_indices = non_spec_state_indices_tensor[
                     : mixed_qkv_ns.size(0)
                 ]
-                packed_conv_out = torch.empty_like(mixed_qkv_ns)
-                mixed_qkv_ns = causal_conv1d_update(
-                    mixed_qkv_ns,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    activation="silu",
-                    conv_state_indices=decode_conv_indices,
-                    validate_data=True,
-                    out=packed_conv_out,
-                )
-                (
-                    core_attn_out_non_spec,
-                    _,
-                ) = fused_recurrent_kda_packed_decode(
-                    mixed_qkv=mixed_qkv_ns,
-                    raw_g=g1_ns,
-                    raw_beta=beta_ns,
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    initial_state=recurrent_state,
-                    state_indices=decode_conv_indices,
-                )
+                if envs.VLLM_BATCH_INVARIANT:
+                    # A decode token in a mixed prefill/decode scheduler step
+                    # is handled by the per-sequence prefill path above. Use
+                    # that exact arithmetic path for pure decode too, instead
+                    # of switching to the fused packed-decode kernels.
+                    decode_has_initial_state = torch.ones_like(
+                        decode_conv_indices, dtype=torch.bool
+                    )
+                    q_ns, k_ns, v_ns = mixed_qkv_ns.split(
+                        self.local_projection_size, dim=-1
+                    )
+
+                    def _decode_conv(
+                        x: torch.Tensor,
+                        state: torch.Tensor,
+                        weight: torch.Tensor,
+                    ) -> torch.Tensor:
+                        parts = []
+                        for seq_idx in range(x.shape[0]):
+                            local_query_start_loc = (
+                                non_spec_state_indices_tensor.new_tensor([0, 1])
+                            )
+                            part = causal_conv1d_fn(
+                                x[seq_idx : seq_idx + 1].transpose(0, 1),
+                                weight,
+                                None,
+                                activation="silu",
+                                conv_states=state,
+                                has_initial_state=decode_has_initial_state[
+                                    seq_idx : seq_idx + 1
+                                ],
+                                cache_indices=decode_conv_indices[
+                                    seq_idx : seq_idx + 1
+                                ],
+                                query_start_loc=local_query_start_loc,
+                                metadata=None,
+                            ).transpose(0, 1)
+                            parts.append(part)
+                        return torch.cat(parts, dim=0)
+
+                    q_ns = _decode_conv(q_ns, q_conv_state, q_conv_weight)
+                    k_ns = _decode_conv(k_ns, k_conv_state, k_conv_weight)
+                    v_ns = _decode_conv(v_ns, v_conv_state, v_conv_weight)
+                    q_ns, k_ns, v_ns = (
+                        rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
+                        for x in (q_ns, k_ns, v_ns)
+                    )
+                    initial_state = gather_initial_states(
+                        recurrent_state,
+                        decode_conv_indices,
+                        decode_has_initial_state,
+                    )
+                    out_parts = []
+                    state_parts = []
+                    for seq_idx in range(initial_state.shape[0]):
+                        seq_out, seq_state = chunk_kda_with_fused_gate(
+                            q=q_ns[:, seq_idx : seq_idx + 1],
+                            k=k_ns[:, seq_idx : seq_idx + 1],
+                            v=v_ns[:, seq_idx : seq_idx + 1],
+                            raw_g=g1_ns[:, seq_idx : seq_idx + 1],
+                            raw_beta=beta_ns[:, seq_idx : seq_idx + 1],
+                            A_log=self.A_log,
+                            g_bias=self.dt_bias,
+                            lower_bound=self.gate_lower_bound,
+                            initial_state=initial_state[seq_idx : seq_idx + 1],
+                            output_final_state=True,
+                            use_qk_l2norm_in_kernel=True,
+                            cu_seqlens=None,
+                        )
+                        out_parts.append(seq_out)
+                        state_parts.append(seq_state)
+                    core_attn_out_non_spec = torch.cat(out_parts, dim=1)
+                    last_recurrent_state = torch.cat(state_parts, dim=0)
+                    recurrent_state[decode_conv_indices] = last_recurrent_state
+                else:
+                    packed_conv_out = torch.empty_like(mixed_qkv_ns)
+                    mixed_qkv_ns = causal_conv1d_update(
+                        mixed_qkv_ns,
+                        conv_state,
+                        conv_weights,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=decode_conv_indices,
+                        validate_data=True,
+                        out=packed_conv_out,
+                    )
+                    (
+                        core_attn_out_non_spec,
+                        _,
+                    ) = fused_recurrent_kda_packed_decode(
+                        mixed_qkv=mixed_qkv_ns,
+                        raw_g=g1_ns,
+                        raw_beta=beta_ns,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=recurrent_state,
+                        state_indices=decode_conv_indices,
+                    )
 
         # Restore the scheduler's original token order for mixed batches.
         if core_attn_out_spec is not None and core_attn_out_non_spec is not None:

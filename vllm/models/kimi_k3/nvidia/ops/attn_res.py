@@ -10,6 +10,7 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -190,7 +191,8 @@ def attn_res(
     # inputs. The op is only compiled under CUDA >= 13, so a device check alone
     # is not enough to know it exists.
     if (
-        hidden_size == 7168
+        not envs.VLLM_BATCH_INVARIANT
+        and hidden_size == 7168
         and prefix.stride(0) == hidden_size
         and (delta is None or delta.stride(0) == hidden_size)
         and 0 <= num_blocks <= 8

@@ -986,6 +986,12 @@ def enable_kimi_k3_low_latency_gemm(
     (:data:`KIMI_K3_PROJECTIONS` on SM103, :data:`KIMI_K3_PROJECTIONS_SM100`
     on SM100, :data:`KIMI_K3_PROJECTIONS_SM90` on SM90).
     """
+    # These decode optimizations intentionally dispatch to different kernels
+    # based on the total token count M.  Until every selected implementation
+    # provides the batch-invariance contract, leave the standard linear
+    # methods installed so VLLM_BATCH_INVARIANT can apply its fixed kernels.
+    if envs.VLLM_BATCH_INVARIANT:
+        return
     if dtype != torch.bfloat16:
         return
     table = _low_latency_table()

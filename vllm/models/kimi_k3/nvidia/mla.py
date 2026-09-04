@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
@@ -48,6 +49,7 @@ from vllm.config import (
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
 from vllm.model_executor.layers.attention.attention import (
     _init_kv_cache_quant,
     set_default_quant_scales,
@@ -482,6 +484,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor) -> None:
         """Project latent attention output back to ``v`` via ``W_UV`` (bmm)."""
+        if envs.VLLM_BATCH_INVARIANT:
+            x = x.view(-1, self.num_local_heads, self.kv_lora_rank)
+            out = out.view(-1, self.num_local_heads, self.v_head_dim)
+            # The regular BMM chooses a different reduction strategy as the
+            # token dimension changes.  Use the fixed invariant GEMM for each
+            # head so every request sees the same arithmetic at every batch M.
+            for head in range(self.num_local_heads):
+                out[:, head, :].copy_(
+                    linear_batch_invariant(x[:, head, :], self.W_UV[head].t())
+                )
+            return
         # (B, N, L) -> (N, B, L)
         x = x.view(-1, self.num_local_heads, self.kv_lora_rank).transpose(0, 1)
         out = out.view(-1, self.num_local_heads, self.v_head_dim)
@@ -511,6 +524,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     def _unquantized_gemm(
         self, hidden_states: torch.Tensor, weight: torch.Tensor
     ) -> torch.Tensor:
+        if envs.VLLM_BATCH_INVARIANT:
+            return linear_batch_invariant(hidden_states, weight)
         out = try_low_latency_gemm(hidden_states, weight)
         return out if out is not None else F.linear(hidden_states, weight)
 
@@ -701,7 +716,20 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
             # BMM1: absorb q_nope into latent space. (N,B,P) x (N,P,L) -> (B,N,L)
-            ql_nope = torch.bmm(mqa_q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+            if envs.VLLM_BATCH_INVARIANT:
+                ql_nope = torch.empty(
+                    (num_mqa_tokens, self.num_local_heads, self.kv_lora_rank),
+                    dtype=mqa_q_nope.dtype,
+                    device=mqa_q_nope.device,
+                )
+                for head in range(self.num_local_heads):
+                    ql_nope[:, head, :] = linear_batch_invariant(
+                        mqa_q_nope[:, head, :], self.W_UK_T[head].t()
+                    )
+            else:
+                ql_nope = torch.bmm(mqa_q_nope.transpose(0, 1), self.W_UK_T).transpose(
+                    0, 1
+                )
             # Fused: concat mqa_q = [ql_nope | q_pe] and insert the decode-token
             # latent into the paged cache (one launch, right before forward_mqa).
             mqa_q = self._decode_concat_cache(

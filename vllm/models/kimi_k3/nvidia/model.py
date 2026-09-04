@@ -18,6 +18,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -307,13 +308,19 @@ class KimiMLP(nn.Module):
             # compute this rank's partial for all of them, then reduce-scatter,
             # which sums across TP and restores the sequence sharding.
             x = sp_all_gather(x)
-        gate_up, _ = self.gate_up_proj(x)
+        if envs.VLLM_BATCH_INVARIANT:
+            gate_up = linear_batch_invariant(x, self.gate_up_proj.weight)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
 
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(x):
             return self.gemm_rs_ar(x, self.down_proj.weight)
 
-        x, _ = self.down_proj(x)
+        if envs.VLLM_BATCH_INVARIANT:
+            x = linear_batch_invariant(x, self.down_proj.weight)
+        else:
+            x, _ = self.down_proj(x)
         if self.shard_sequence_parallel:
             x = sp_reduce_scatter(x)
         return x
@@ -344,6 +351,11 @@ class KimiRoutedOutputTransform(nn.Module):
         """
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
+        if envs.VLLM_BATCH_INVARIANT:
+            hidden_states = linear_batch_invariant(hidden_states, self.up_proj.weight)
+            if residual is not None:
+                hidden_states.add_(residual)
+            return hidden_states
         if residual is not None:
             return residual.addmm_(hidden_states, self.up_proj.weight.t())
         hidden_states, _ = self.up_proj(hidden_states)
@@ -780,7 +792,18 @@ class KimiMoE(nn.Module):
         def _router(
             hidden_states: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor | None]:
-            router_logits, _ = self.gate(hidden_states)
+            if envs.VLLM_BATCH_INVARIANT and hidden_states.shape[0] > 1:
+                # GateLinear dispatches by M (notably at 16/32 tokens). Keep
+                # the exact high-precision M=1 router path for every token.
+                router_logits = torch.cat(
+                    [
+                        self.gate(hidden_states[i : i + 1])[0]
+                        for i in range(hidden_states.shape[0])
+                    ],
+                    dim=0,
+                )
+            else:
+                router_logits, _ = self.gate(hidden_states)
             if not self.use_mega_moe:
                 return router_logits, None
             return fused_grouped_topk(
@@ -800,6 +823,12 @@ class KimiMoE(nn.Module):
             router_output, topk_ids = _router(hidden_states)
             return hidden_states, router_output, topk_ids
         num_tokens = hidden_states.shape[0]
+        if envs.VLLM_BATCH_INVARIANT:
+            router_output, topk_ids = _router(hidden_states)
+            routed_hidden_states = linear_batch_invariant(
+                hidden_states, down_proj.weight
+            )
+            return routed_hidden_states, router_output, topk_ids
         (router_output, topk_ids), (routed_hidden_states, _) = (
             maybe_execute_in_parallel(
                 lambda: _router(hidden_states),
@@ -807,7 +836,10 @@ class KimiMoE(nn.Module):
                 self._down_proj_events[0],
                 self._down_proj_events[1],
                 self._down_proj_stream
-                if num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+                if (
+                    not envs.VLLM_BATCH_INVARIANT
+                    and num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+                )
                 else None,
             )
         )

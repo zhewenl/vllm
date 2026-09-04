@@ -4,6 +4,7 @@
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -173,6 +174,10 @@ class TrtLlmMxfp4ExpertsMonolithic(
         return True
 
     @staticmethod
+    def _supports_batch_invariance() -> bool:
+        return True
+
+    @staticmethod
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
@@ -221,6 +226,34 @@ class TrtLlmMxfp4ExpertsMonolithic(
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         from flashinfer import trtllm_fp4_block_scale_moe
 
+        num_tokens = hidden_states.shape[0]
+        if envs.VLLM_BATCH_INVARIANT and num_tokens > 1:
+            # The TRTLLM grouped MoE kernel changes tactics and reduction order
+            # with M. Execute a fixed M=1 kernel for each token so a token's
+            # result cannot depend on the surrounding batch.
+            token_outputs = []
+            for token_index in range(num_tokens):
+                token_output = self.apply(
+                    hidden_states[token_index : token_index + 1],
+                    w1,
+                    w2,
+                    router_logits[token_index : token_index + 1],
+                    activation,
+                    global_num_experts,
+                    expert_map,
+                    None
+                    if a1q_scale is None
+                    else a1q_scale[token_index : token_index + 1],
+                    apply_router_weight_on_input,
+                    num_expert_group,
+                    e_score_correction_bias,
+                    routed_scaling_factor,
+                    topk_group,
+                )
+                assert isinstance(token_output, torch.Tensor)
+                token_outputs.append(token_output)
+            return torch.cat(token_outputs, dim=0)
+
         if a1q_scale is not None:
             x_quant = hidden_states
             x_scale = a1q_scale.view(torch.float8_e4m3fn)
@@ -228,8 +261,9 @@ class TrtLlmMxfp4ExpertsMonolithic(
             assert hidden_states.dtype == torch.bfloat16
             x_quant = hidden_states
             x_scale = None
-        num_tokens = hidden_states.shape[0]
-        defer = self.moe_config.should_defer_moe_finalize(num_tokens)
+        defer = self.moe_config.should_defer_moe_finalize(num_tokens) and not (
+            envs.VLLM_BATCH_INVARIANT
+        )
         finalized_output = None
         if not defer:
             finalized_output = torch.empty(

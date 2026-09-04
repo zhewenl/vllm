@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import logging
+import queue
 import threading
 import time
 from collections import defaultdict
@@ -59,6 +60,8 @@ from vllm.v1.kv_cache_interface import (
     KpoolTailSpec,
     KVCacheSpec,
     MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import RequestStatus
@@ -94,6 +97,9 @@ class TransferRegion:
     block_len: int
     kv_block_len: int
     group_index: int = 0
+    # TP-invariant region (e.g. MLA): every TP rank holds the full block,
+    # so it transfers whole regardless of the producer/consumer TP ratio.
+    replicated: bool = False
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
@@ -124,6 +130,7 @@ def _expand_transfer_regions(
     layer_names: list[str],
     layer_indices: list[int],
     group_indices: list[int] | None = None,
+    replicated_flags: list[bool] | None = None,
 ) -> list[TransferRegion]:
     """Expand registered KV tensors into the regions transferred by Mooncake."""
     assert (
@@ -145,6 +152,13 @@ def _expand_transfer_regions(
         "Mooncake transfer regions require matching group metadata lengths, "
         f"got group_indices={len(group_indices)}, layer_names={len(layer_names)}."
     )
+    if replicated_flags is None:
+        replicated_flags = [False] * len(layer_names)
+    assert len(replicated_flags) == len(layer_names), (
+        "Mooncake transfer regions require matching replicated metadata "
+        f"lengths, got replicated_flags={len(replicated_flags)}, "
+        f"layer_names={len(layer_names)}."
+    )
     regions: list[TransferRegion] = []
     for (
         base_addr,
@@ -153,6 +167,7 @@ def _expand_transfer_regions(
         layer_name,
         layer_index,
         group_index,
+        replicated,
     ) in zip(
         base_addrs,
         block_lens,
@@ -160,6 +175,7 @@ def _expand_transfer_regions(
         layer_names,
         layer_indices,
         group_indices,
+        replicated_flags,
     ):
         regions.append(
             TransferRegion(
@@ -169,6 +185,7 @@ def _expand_transfer_regions(
                 block_len=block_len,
                 kv_block_len=kv_block_len,
                 group_index=group_index,
+                replicated=replicated,
             )
         )
     return regions
@@ -253,6 +270,18 @@ def _validate_asymmetric_region_lengths(
     for idx, (local_region, remote_region) in enumerate(
         zip(local_regions, remote_regions)
     ):
+        if local_region.replicated or remote_region.replicated:
+            # TP-invariant region (e.g. an MLA side cache of a mixed GQA+MLA
+            # model): every TP rank holds the full block, so lengths must
+            # match regardless of the TP ratio. kv_block_len is already in
+            # kernel-block units on both sides.
+            if local_region.kv_block_len != remote_region.kv_block_len:
+                return (
+                    "Mooncake replicated KV region length mismatch at region "
+                    f"{idx}: local={local_region.kv_block_len}, "
+                    f"remote={remote_region.kv_block_len}."
+                )
+            continue
         if tp_ratio == 1:
             if local_region.kv_block_len != remote_region.kv_block_len:
                 return (
@@ -550,6 +579,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Get block IDs that failed to load via Mooncake."""
+        assert self.connector_worker is not None
+        return self.connector_worker.get_block_ids_with_load_errors()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -997,6 +1031,14 @@ class MooncakeConnectorWorker:
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
 
+        # Failed receives, surfaced to the scheduler so affected requests
+        # complete instead of hanging in WAITING_FOR_REMOTE_KVS.
+        self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
+        self._invalid_block_ids: queue.Queue[set[int]] = queue.Queue()
+        # Each failed request is reported once, no matter how many of its
+        # (multi-rank) pull tasks report the failure.
+        self._reported_failed_recv: set[ReqId] = set()
+
         self.xfer_stats = MooncakeKVConnectorStats()
 
         self.block_size = vllm_config.cache_config.block_size
@@ -1027,6 +1069,17 @@ class MooncakeConnectorWorker:
             for group_index, group in enumerate(kv_cache_config.kv_cache_groups)
             for layer in group.layer_names
         }
+        # Mirror of NixlConnector's HMA gate: invalid block IDs are reported
+        # for group 0 only, and skipped entirely under HMA (the scheduler's
+        # invalid-blocks path does not support multi-group models yet, see
+        # https://github.com/vllm-project/vllm/issues/50687).
+        self._is_hma_required = (
+            not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+            and any(
+                not isinstance(spec, FullAttentionSpec)
+                for spec in self._layer_specs.values()
+            )
+        )
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -1531,6 +1584,7 @@ class MooncakeConnectorWorker:
                     remote_kv_block_len=remote_region.kv_block_len,
                     remote_tp_rank=agent_meta.remote_tp_rank,
                     remote_tp_size=agent_meta.remote_tp_size,
+                    region_replicated=local_region.replicated,
                 )
                 if not should_transfer:
                     # Replicated KV cache: only one producer rank in the TP group
@@ -1792,16 +1846,41 @@ class MooncakeConnectorWorker:
         finished_recving_reqs = recv_fut.result() if recv_fut else set()
         finished_sending_reqs = send_fut.result() if send_fut else set()
 
+        # Surface failed receives to the scheduler (the failed blocks are
+        # reported separately via get_block_ids_with_load_errors).
+        failed_recv_reqs: set[ReqId] = set()
+        while not self._failed_recv_reqs.empty():
+            try:
+                failed_recv_reqs.add(self._failed_recv_reqs.get_nowait())
+            except queue.Empty:
+                break
+        finished_recving_reqs |= failed_recv_reqs
+
         if finished_sending_reqs or finished_recving_reqs:
             logger.debug(
                 "Rank %s, get_finished: %s requests done sending "
-                "and %s requests done recving",
+                "and %s requests done recving (%s failed)",
                 self.tp_rank,
                 len(finished_sending_reqs),
                 len(finished_recving_reqs),
+                len(failed_recv_reqs),
             )
 
         return finished_sending_reqs or None, finished_recving_reqs or None
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Return and clear the set of block IDs that failed to load.
+
+        Called by the scheduler to identify blocks that must be recomputed
+        after a Mooncake transfer failure.
+        """
+        result: set[int] = set()
+        while not self._invalid_block_ids.empty():
+            try:
+                result.update(self._invalid_block_ids.get_nowait())
+            except queue.Empty:
+                break
+        return result
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """Return transfer stats collected since the last call, or None
@@ -1861,6 +1940,8 @@ class MooncakeConnectorWorker:
                             response.err_msg,
                         )
                         self.xfer_stats.record_failed_recv()
+                        for pull_meta in pull_metas.values():
+                            self._handle_failed_transfer(pull_meta)
                         return
                     self.process_pulling_result(response, pull_metas)
                     if response.status == MooncakeXferResponseStatus.FINISH:
@@ -1870,7 +1951,31 @@ class MooncakeConnectorWorker:
         except Exception as e:
             logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
             self.xfer_stats.record_failed_recv()
+            for pull_meta in pull_metas.values():
+                self._handle_failed_transfer(pull_meta)
             return
+
+    def _handle_failed_transfer(self, pull_meta: PullReqMeta):
+        """Report a failed receive so the scheduler can complete the request
+        instead of leaving it in WAITING_FOR_REMOTE_KVS forever.
+
+        Mirrors NixlConnector: the request's group-0 blocks are reported as
+        invalid so the scheduler recomputes or fails it (skipped under HMA,
+        where the invalid-block path does not support multi-group models yet,
+        see https://github.com/vllm-project/vllm/issues/50687). When invalid
+        blocks cannot be reported, the request is merged into the
+        finished-recving set instead. The two channels are mutually
+        exclusive: reporting both would make the scheduler finish the request
+        via the invalid-block path and then trip its
+        `assert req_id in self.requests` on the finished-recving duplicate.
+        """
+        if pull_meta.d_req_id in self._reported_failed_recv:
+            return
+        self._reported_failed_recv.add(pull_meta.d_req_id)
+        if pull_meta.local_block_ids and not self._is_hma_required:
+            self._invalid_block_ids.put(set(pull_meta.local_block_ids[0]))
+        else:
+            self._failed_recv_reqs.put(pull_meta.d_req_id)
 
     def process_pulling_result(
         self,
@@ -1883,7 +1988,10 @@ class MooncakeConnectorWorker:
             pull_meta = pull_metas[req_id]
             # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
-            if pull_meta.pull_tasks_count == 0:
+            if (
+                pull_meta.pull_tasks_count == 0
+                and pull_meta.d_req_id not in self._reported_failed_recv
+            ):
                 self.finished_recving_reqs.add(pull_meta.d_req_id)
 
         if ok_reqs:
@@ -1895,6 +2003,9 @@ class MooncakeConnectorWorker:
                 response.err_reqs,
                 response.err_msg,
             )
+            for req_id in response.err_reqs:
+                if (pull_meta := pull_metas.get(req_id)) is not None:
+                    self._handle_failed_transfer(pull_meta)
 
     async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
         url = remote_bootstrap_addr + "/query"
@@ -1992,10 +2103,29 @@ class MooncakeConnectorWorker:
                 self.receive_kv(remote_engine_id, pull_metas)
 
     async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
+        # This coroutine is fire-and-forget (run_coroutine_threadsafe), so it
+        # must never raise: an exception would be silently dropped and every
+        # unprocessed transfer_id in the batch would wedge consumer pulls
+        # waiting on `ready` until the abort timeout.
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
-                send_meta = self.reqs_need_send[transfer_id]
+                send_meta = self.reqs_need_send.get(transfer_id)
+                if send_meta is None:
+                    # The alloc-time placeholder is missing; recreate it so
+                    # the request can still rendezvous with a consumer pull.
+                    logger.warning(
+                        "Recreating missing send entry for request %s (transfer_id=%s)",
+                        p_req_id,
+                        transfer_id,
+                    )
+                    send_meta = SendBlockMeta(
+                        p_req_id=p_req_id,
+                        transfer_id=transfer_id,
+                        local_block_ids=[],
+                        ready=asyncio.Event(),
+                    )
+                    self.reqs_need_send[transfer_id] = send_meta
                 send_meta.p_req_id = p_req_id
                 send_meta.local_block_ids = block_ids
                 send_meta.expire_time = (
@@ -2015,9 +2145,13 @@ class MooncakeConnectorWorker:
                         ready=asyncio.Event(),
                     )
         for transfer_id in metadata.reqs_not_processed:
-            send_meta = self.reqs_need_send.pop(transfer_id)
-            if send_meta:
-                assert not send_meta.ready.is_set()
+            send_meta = self.reqs_need_send.pop(transfer_id, None)
+            if send_meta is not None and send_meta.ready.is_set():
+                logger.warning(
+                    "Dropping an already-ready send entry (transfer_id=%s); "
+                    "any in-flight consumer pull will time out and fail over.",
+                    transfer_id,
+                )
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if not self.is_kv_producer and metadata.reqs_to_recv:
@@ -2034,6 +2168,18 @@ class MooncakeConnectorWorker:
 
     def _producer_cache_is_replicated(self) -> bool:
         return self.transfer_topo.local_replicates_kv_cache
+
+    def _is_replicated_layer(self, layer_name: str) -> bool:
+        """Whether the layer's KV cache is TP-invariant (held in full by
+        every TP rank), e.g. an MLA attention or side cache.
+
+        A KV-head-count rule cannot be applied here: the spec's
+        num_kv_heads is the per-rank count (total // tp_size), so a
+        TP-sharded GQA layer is indistinguishable from a replicated one.
+        Whole-engine replicated GQA stays covered by the global
+        producer_cache_replicated flag."""
+        spec = self._layer_specs.get(layer_name)
+        return isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
 
     def _get_transfer_regions(
         self,
@@ -2056,6 +2202,12 @@ class MooncakeConnectorWorker:
             layer_names=layer_names,
             layer_indices=layer_indices,
             group_indices=group_indices,
+            # Both sides register the same model's layers, so the local spec
+            # lookup also classifies the remote regions (region alignment
+            # keys on layer name).
+            replicated_flags=[
+                self._is_replicated_layer(layer_name) for layer_name in layer_names
+            ],
         )
 
     def _get_sender_transfer_plan(
@@ -2064,6 +2216,7 @@ class MooncakeConnectorWorker:
         remote_kv_block_len: int,
         remote_tp_rank: int,
         remote_tp_size: int,
+        region_replicated: bool = False,
     ) -> tuple[bool, int, int, int]:
         return _compute_sender_transfer_plan(
             local_tp_rank=self.tp_rank,
@@ -2072,7 +2225,12 @@ class MooncakeConnectorWorker:
             remote_tp_size=remote_tp_size,
             local_kv_block_len=local_kv_block_len,
             remote_kv_block_len=remote_kv_block_len,
-            producer_cache_replicated=self._producer_cache_is_replicated(),
+            # A replicated region follows the same plan a fully replicated
+            # (e.g. MLA) producer cache would: whole block at offset 0, sent
+            # by exactly one producer rank per consumer region.
+            producer_cache_replicated=(
+                self._producer_cache_is_replicated() or region_replicated
+            ),
         )
 
     def _log_debug_cache_registration(

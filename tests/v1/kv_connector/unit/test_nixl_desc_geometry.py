@@ -100,11 +100,11 @@ class _RecordingNixl:
 
 def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blocks):
     """Build a real pull worker with a hybrid MLA + 2xKDA HMA layout."""
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
-        base_worker as bw,
-    )
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.p2p import (
+        base_worker as bw,
     )
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import (
@@ -171,11 +171,18 @@ def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blo
     from vllm.config import set_current_vllm_config
 
     with (
-        patch.object(bw, "NixlWrapper", _RecordingNixl),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+            _RecordingNixl,
+        ),
         patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
         patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
         patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
         patch.object(bw, "current_platform", fake_platform),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.current_platform",
+            fake_platform,
+        ),
         patch(
             "vllm.model_executor.layers.mamba.mamba_utils.get_conv_state_layout",
             return_value="DS",
@@ -221,11 +228,11 @@ def test_register_compressed_indexer_uses_virtual_transfer_pages(
     from unittest.mock import MagicMock
 
     from vllm.config import set_current_vllm_config
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
-        base_worker as bw,
-    )
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.p2p import (
+        base_worker as bw,
     )
     from vllm.v1.kv_cache_interface import (
         KpoolTailSpec,
@@ -332,11 +339,18 @@ def test_register_compressed_indexer_uses_virtual_transfer_pages(
         caches.reverse()
 
     with (
-        patch.object(bw, "NixlWrapper", _RecordingNixl),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+            _RecordingNixl,
+        ),
         patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
         patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
         patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
         patch.object(bw, "current_platform", fake_platform),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.current_platform",
+            fake_platform,
+        ),
         set_current_vllm_config(vllm_config),
     ):
         worker = NixlConnectorWorker(vllm_config, "local-engine", kv_cache_config)
@@ -420,7 +434,7 @@ def _owned_byte_ranges(worker, group_logical_ids):
 
 
 def _assert_local_writes_within(worker, owned_ranges):
-    nixl = worker.nixl_wrapper
+    nixl = worker.transport.agent
     assert nixl.xfers, "no transfers were posted"
     violations = []
     total_descs = 0
@@ -497,7 +511,7 @@ def test_hetero_ppl_multi_read_writes_stay_within_request_blocks():
     total = _assert_local_writes_within(worker, owned)
     # Multi-read: rank 0 carries the replicated MLA + its SSM shard,
     # rank 1 carries only its SSM shard.
-    assert len(worker.nixl_wrapper.xfers) == 2
+    assert len(worker.transport.agent.xfers) == 2
     assert total > 0
 
 
@@ -602,7 +616,7 @@ def _run_hetero_case(
     _assert_local_writes_within(worker, owned)
 
     # Invariant 2: local<->remote attention pairs are token-aligned.
-    nixl = worker.nixl_wrapper
+    nixl = worker.transport.agent
     local_bases = [t.data_ptr() for t in worker._test_tensors]
     remote_bases = [0x10_000_000, 0x20_000_000]
     local_unified = worker._test_unified_page
@@ -813,10 +827,10 @@ def _make_csa_linear_ple_worker(scratch_aliases: str = "compressed"):
     from unittest.mock import MagicMock
 
     from vllm.config import set_current_vllm_config
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
     )
+    from vllm.distributed.kv_transfer.kv_connector.v1.p2p import base_worker as bw
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import (
         CircularBufferSpec,
@@ -937,11 +951,18 @@ def _make_csa_linear_ple_worker(scratch_aliases: str = "compressed"):
     fake_platform.get_nixl_memory_type.return_value = "VRAM"
 
     with (
-        patch.object(bw, "NixlWrapper", _RecordingNixl),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+            _RecordingNixl,
+        ),
         patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
         patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
         patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
         patch.object(bw, "current_platform", fake_platform),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.current_platform",
+            fake_platform,
+        ),
         patch(
             "vllm.model_executor.layers.mamba.mamba_utils.get_conv_state_layout",
             return_value="DS",

@@ -179,6 +179,19 @@ KVConnectorFactory.register_connector(
     "NixlConnector",
 )
 
+for _connector_name in (
+    "P2pConnector",
+    "P2pPullConnector",
+    "P2pPushConnector",
+    "MooncakePullConnector",
+    "MooncakePushConnector",
+):
+    KVConnectorFactory.register_connector(
+        _connector_name,
+        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.connector",
+        "P2pPushConnector" if "Push" in _connector_name else "P2pPullConnector",
+    )
+
 KVConnectorFactory.register_connector(
     "NixlPullConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl",

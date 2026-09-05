@@ -592,7 +592,7 @@ def test_cannot_recv():
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler.current_platform"
+    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_scheduler.current_platform"
 )
 def test_p_side_chunked_prefill_mamba(mock_platform):
     """P-side integration: Mamba N-1 truncation + chunked prefill completes.

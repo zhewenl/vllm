@@ -1154,7 +1154,7 @@ class VllmConfig:
         # A NIXL side is either fully replicated or fully DCP-sharded; MLA only.
         if (
             self.kv_transfer_config is not None
-            and self.kv_transfer_config.has_connector("NixlConnector")
+            and self.kv_transfer_config.has_p2p_pull_connector()
         ):
             assert self.parallel_config.prefill_context_parallel_size == 1, (
                 "NIXL does not support prefill context parallelism."
@@ -2781,8 +2781,9 @@ class VllmConfig:
                 "deprecated when PCP is fully supported."
             )
 
-        if self.kv_transfer_config is None or not self.kv_transfer_config.has_connector(
-            "NixlConnector"
+        if (
+            self.kv_transfer_config is None
+            or not self.kv_transfer_config.has_p2p_pull_connector()
         ):
             return
 
@@ -2816,7 +2817,7 @@ class VllmConfig:
         # size is pinned to block_size by each worker.
         nixl_pd_active = (
             self.kv_transfer_config is not None
-            and self.kv_transfer_config.has_connector("NixlConnector")
+            and self.kv_transfer_config.has_p2p_pull_connector()
         )
         if self.parallel_config.decode_context_parallel_size > 1 and not nixl_pd_active:
             assert (

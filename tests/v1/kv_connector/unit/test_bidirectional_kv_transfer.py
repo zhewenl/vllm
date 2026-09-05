@@ -99,10 +99,10 @@ def _make_connector_with_fake_worker(
         kv_cache_config=kv_cache_config,
     )
     worker = connector.connector_worker
-    assert isinstance(worker.nixl_wrapper, FakeNixlWrapper)
+    assert isinstance(worker.transport.agent, FakeNixlWrapper)
     worker.kv_cache_layout = "LBHNC"
     if do_handshake:
-        remote_agents, _ = worker._nixl_handshake(
+        remote_agents, _ = worker._p2p_handshake(
             host="localhost",
             port=1234,
             remote_tp_size=1,
@@ -438,7 +438,7 @@ def test_build_connector_meta_multiple_requests():
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_p_node_pull_kv_from_d(dist_init):
@@ -452,7 +452,7 @@ def test_p_node_pull_kv_from_d(dist_init):
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_p_node_pull_then_send_kv(dist_init):
@@ -466,15 +466,15 @@ def test_p_node_pull_then_send_kv(dist_init):
     worker._reqs_to_send["req-p2"] = time.perf_counter() + 60
     worker._reqs_to_process.add("req-p2")
     notif = f"req-p2:{worker.world_size}".encode()
-    orig = worker.nixl_wrapper.get_new_notifs
-    worker.nixl_wrapper.get_new_notifs = lambda: {"agent": [notif]}
+    orig = worker.transport.agent.get_new_notifs
+    worker.transport.agent.get_new_notifs = lambda: {"agent": [notif]}
     done_sending, _ = connector.get_finished(finished_req_ids=set())
     assert "req-p2" in done_sending
-    worker.nixl_wrapper.get_new_notifs = orig
+    worker.transport.agent.get_new_notifs = orig
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_p_node_deferred_pull_on_no_handshake(dist_init):
@@ -938,7 +938,7 @@ _REMOTE = FakeNixlConnectorWorker.REMOTE_ENGINE_ID
     ],
 )
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_turn2_deadline_gate(dist_init, offset, expiry_delta, expect_declined):
@@ -974,7 +974,7 @@ def test_turn2_deadline_gate(dist_init, offset, expiry_delta, expect_declined):
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_turn2_full_prefix_hit_with_expired_deadline_skips_gate(dist_init):
@@ -1051,7 +1051,7 @@ def test_handshake_listener_appends_perf_counter_frame():
     host = "127.0.0.1"
     port = get_open_port()
     listener = threading.Thread(
-        target=NixlBaseConnectorScheduler._nixl_handshake_listener,
+        target=NixlBaseConnectorScheduler._p2p_handshake_listener,
         args=(encoded_data, ready_event, stop_event, host, port),
         daemon=True,
     )

@@ -136,6 +136,8 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         metric_types: dict[type[PromMetric], type[PromMetricT]],
         labelnames: list[str],
         per_engine_labelvalues: dict[int, list[object]],
+        *,
+        metric_prefix: str = "nixl",
     ):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
 
@@ -155,7 +157,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             5.0,
         ]
         nixl_histogram_xfer_time = self._histogram_cls(
-            name="vllm:nixl_xfer_time_seconds",
+            name=f"vllm:{metric_prefix}_xfer_time_seconds",
             documentation="Histogram of transfer duration for NIXL KV Cache transfers.",
             buckets=buckets[1:],
             labelnames=labelnames,
@@ -164,7 +166,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             nixl_histogram_xfer_time, self.per_engine_labelvalues
         )
         nixl_histogram_post_time = self._histogram_cls(
-            name="vllm:nixl_post_time_seconds",
+            name=f"vllm:{metric_prefix}_post_time_seconds",
             documentation="Histogram of transfer post time for NIXL KV"
             " Cache transfers.",
             buckets=buckets,
@@ -176,7 +178,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         # uniform 2kb to 16gb range
         buckets = [2 ** (10 + i) for i in range(1, 25, 2)]
         nixl_histogram_bytes_transferred = self._histogram_cls(
-            name="vllm:nixl_bytes_transferred",
+            name=f"vllm:{metric_prefix}_bytes_transferred",
             documentation="Histogram of bytes transferred per NIXL KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
@@ -201,7 +203,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             50000,
         ]
         nixl_histogram_num_descriptors = self._histogram_cls(
-            name="vllm:nixl_num_descriptors",
+            name=f"vllm:{metric_prefix}_num_descriptors",
             documentation="Histogram of number of descriptors per NIXL"
             "  KV Cache transfers.",
             buckets=buckets,
@@ -211,7 +213,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             nixl_histogram_num_descriptors, self.per_engine_labelvalues
         )
         counter_nixl_num_failed_transfers = self._counter_cls(
-            name="vllm:nixl_num_failed_transfers",
+            name=f"vllm:{metric_prefix}_num_failed_transfers",
             documentation="Number of failed NIXL KV Cache transfers.",
             labelnames=labelnames,
         )
@@ -219,7 +221,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             counter_nixl_num_failed_transfers, self.per_engine_labelvalues
         )
         counter_nixl_num_failed_notifications = self._counter_cls(
-            name="vllm:nixl_num_failed_notifications",
+            name=f"vllm:{metric_prefix}_num_failed_notifications",
             documentation="Number of failed NIXL KV Cache notifications.",
             labelnames=labelnames,
         )
@@ -228,7 +230,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         )
 
         counter_nixl_num_kv_expired_reqs = self._counter_cls(
-            name="vllm:nixl_num_kv_expired_reqs",
+            name=f"vllm:{metric_prefix}_num_kv_expired_reqs",
             documentation="Number of requests that had their KV expire. "
             "NOTE: This metric is tracked on the P instance.",
             labelnames=labelnames,

@@ -128,3 +128,15 @@ class KVTransferConfig:
             child.get("kv_connector") == connector_name
             for child in self.kv_connector_extra_config.get("connectors", [])
         )
+
+    def has_p2p_pull_connector(self) -> bool:
+        """Whether the shared pull protocol is used, including legacy aliases."""
+        return any(
+            self.has_connector(name)
+            for name in (
+                "NixlConnector",
+                "P2pConnector",
+                "P2pPullConnector",
+                "MooncakePullConnector",
+            )
+        )

@@ -56,6 +56,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_representative_spec_type,
     zmq_ctx,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.p2p.transport import (
+    FatalTransferError,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
     MambaConvSplitInfo,
     derive_mamba_conv_split,
@@ -338,13 +341,22 @@ class NixlBaseConnectorWorker:
         """
         return region_idx < len(self._region_is_mla) and self._region_is_mla[region_idx]
 
+    def _get_wrapper_cls(self) -> Any:
+        """Allow opt-in transports to reuse the existing P/D protocol."""
+        return NixlWrapper
+
+    def _compute_compatibility_hash(self) -> str:
+        return compute_nixl_compatibility_hash(
+            self.vllm_config, self.backend_name, self._TRANSFER_MODE
+        )
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
         engine_id: str,
         kv_cache_config: "KVCacheConfig",
     ):
-        nixl_wrapper_cls = NixlWrapper
+        nixl_wrapper_cls = self._get_wrapper_cls()
         if nixl_wrapper_cls is None:
             logger.error("NIXL is not available")
             raise RuntimeError("NIXL is not available")
@@ -1146,11 +1158,7 @@ class NixlBaseConnectorWorker:
             else None,
             is_mamba=self._has_mamba,
         )
-        self.compat_hash = compute_nixl_compatibility_hash(
-            self.vllm_config,
-            self.backend_name,
-            transfer_mode=self._TRANSFER_MODE,
-        )
+        self.compat_hash = self._compute_compatibility_hash()
 
         if self._is_csa_linear and self.use_host_buffer:
             raise NotImplementedError(
@@ -2510,6 +2518,8 @@ class NixlBaseConnectorWorker:
                             xfer_state=xfer_state,
                         )
                         self._handle_failed_transfer(req_id, handle)
+                except FatalTransferError:
+                    raise
                 except Exception as e:
                     self._log_failure(
                         failure_type="transfer_exception",

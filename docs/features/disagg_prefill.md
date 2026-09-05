@@ -17,7 +17,7 @@ Two main reasons:
 
 ## Usage example
 
-Now supports 9 types of connectors:
+Available connectors include:
 
 - **ExampleConnector**: refer to [examples/disaggregated/example_connector/run.sh](../../examples/disaggregated/example_connector/run.sh) for the example usage of ExampleConnector disaggregated prefilling.
 - **LMCacheConnectorV1**: refer to [examples/disaggregated/lmcache/disagg_prefill_lmcache_v1/disagg_example_nixl.sh](../../examples/disaggregated/lmcache/disagg_prefill_lmcache_v1/disagg_example_nixl.sh) for the example usage of LMCacheConnectorV1 disaggregated prefilling which uses NIXL as the underlying KV transmission. LMCache also offers a multi-process (MP) mode via `LMCacheMPConnector`, where a standalone `lmcache server` holds the KV cache shared by one or more vLLM instances; see the [LMCache examples](../../examples/disaggregated/lmcache/README.md) and the [LMCache docs](https://docs.lmcache.ai) for setup.
@@ -27,6 +27,7 @@ Now supports 9 types of connectors:
   --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both", "kv_buffer_device":"cuda", "kv_connector_extra_config":{"backends":["UCX", "GDS"]}}'
   ```
 
+- **P2pPullConnector / P2pPushConnector**: share scheduling, HMA planning and metrics across NIXL and native Mooncake engines. `MooncakePullConnector` and `MooncakePushConnector` select Mooncake by default. See [transfer-engine-agnostic P/D connectors](../design/p2p_kv_transfer.md) for the interface, configuration and migration from the legacy Mooncake connector.
 - **MooncakeConnector**: refer to [examples/disaggregated/mooncake_connector/run_mooncake_connector.sh](../../examples/disaggregated/mooncake_connector/run_mooncake_connector.sh) for the example usage of MooncakeConnector disaggregated prefilling. For detailed usage guide, see [MooncakeConnector Usage Guide](mooncake_connector_usage.md).
 - **MoRIIOConnector** (ROCm only): see [MoRI-IO Usage Guide](moriio_connector_usage.md) for example usage and detailed documentation.
 - **MultiConnector**: take advantage of the kv_connector_extra_config: dict[str, Any] already present in KVTransferConfig to stash all the connectors we want in an ordered list of kwargs.such as:

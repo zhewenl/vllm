@@ -83,10 +83,9 @@ def transport_config(engine="mooncake", **extra):
 @pytest.fixture
 def transports(monkeypatch):
     import vllm.platforms
+    from vllm.platforms.cpu import CpuPlatform
 
-    monkeypatch.setattr(
-        vllm.platforms, "current_platform", SimpleNamespace(device_type="cpu")
-    )
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
     monkeypatch.setitem(
         sys.modules, "mooncake.engine", SimpleNamespace(TransferEngine=MemoryEngine)
     )
@@ -343,12 +342,17 @@ def test_nixl_telemetry_converts_microseconds_at_engine_boundary(monkeypatch):
 def test_unsafe_engine_failure_cannot_recycle_request_blocks():
     from unittest.mock import MagicMock
 
-    from vllm.distributed.kv_transfer.kv_connector.v1.p2p.pull_worker import (
+    from vllm.distributed.kv_transfer.kv_connector.v1.p2p.worker import (
         P2pPullConnectorWorker,
     )
 
     worker = object.__new__(P2pPullConnectorWorker)
+    from vllm.distributed.kv_transfer.kv_connector.v1.p2p.legacy import (
+        TransferAgentBridge,
+    )
+
     worker.transport = MagicMock()
+    worker.nixl_wrapper = TransferAgentBridge(worker.transport)
     worker.transport.poll.side_effect = FatalTransferError("DMA may still be active")
     worker._handle_failed_transfer = MagicMock()
     transfers = {"request": [object()]}
@@ -372,3 +376,126 @@ def test_handshake_rejects_different_engines_and_transfer_directions():
     mooncake_pull = compute_p2p_compatibility_hash(config, "FLASH_ATTN")
     mooncake_push = compute_p2p_compatibility_hash(config, "FLASH_ATTN", "push")
     assert len({nixl_pull, mooncake_pull, mooncake_push}) == 3
+
+
+@pytest.mark.parametrize(
+    "name", ["NixlConnector", "NixlPullConnector", "NixlPushConnector"]
+)
+def test_existing_nixl_entry_points_keep_the_native_implementation(name, monkeypatch):
+    """Legacy configuration and the NixlWrapper injection point remain intact."""
+    from vllm.config import KVTransferConfig
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker, connector
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    config = KVTransferConfig(kv_connector=name, kv_role="kv_consumer")
+    cls = KVConnectorFactory.get_connector_class(config)
+    assert cls is getattr(connector, name)
+    assert cls.__module__.endswith(".nixl.connector")
+    native_wrapper = object()
+    monkeypatch.setattr(base_worker, "NixlWrapper", native_wrapper)
+    worker = object.__new__(NixlConnectorWorker)
+    assert worker._get_wrapper_cls() is native_wrapper
+    assert not hasattr(worker, "transport")
+
+
+@pytest.mark.parametrize("operation", ["READ", "WRITE"])
+def test_existing_wrapper_calls_transfer_through_the_bridge(transports, operation):
+    """The unchanged descriptor/telemetry API reaches the selected native engine."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
+        NixlKVConnectorStats,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.p2p.legacy import (
+        TransferAgentBridge,
+    )
+
+    first, second = transports
+    bridge = TransferAgentBridge(first)
+    local = ctypes.create_string_buffer(b"local---", 8)
+    remote = ctypes.create_string_buffer(b"remote--", 8)
+    local_addr, remote_addr = ctypes.addressof(local), ctypes.addressof(remote)
+    registration = bridge.get_reg_descs([(local_addr, 8, 0, "")], "DRAM")
+    bridge.register_memory(registration)
+    remote_registration = second.register_memory([(remote_addr, 8, 0)])
+    peer = bridge.add_remote_agent(second.export_peer())
+    local_desc = bridge.prep_xfer_dlist(
+        "NIXL_INIT_AGENT", bridge.get_xfer_descs([(local_addr, 8, 0)], "DRAM")
+    )
+    remote_desc = bridge.prep_xfer_dlist(peer, [(remote_addr, 8, 0)])
+    handle = bridge.make_prepped_xfer(
+        operation, local_desc, [0], remote_desc, [0], b"done:1"
+    )
+    bridge.transfer(handle)
+    assert wait_done(first, handle) == TransferState.DONE
+    assert bridge.check_xfer_state(handle) == "DONE"
+    assert (
+        local.raw == remote.raw == (b"remote--" if operation == "READ" else b"local---")
+    )
+    assert second.get_notifications() == {first._peer.name: [b"done:1"]}
+    stats = NixlKVConnectorStats()
+    stats.record_transfer(bridge.get_xfer_telemetry(handle))
+    assert stats.data["bytes_transferred"] == [8]
+    assert stats.data["transfer_duration"][0] == pytest.approx(
+        first.telemetry(handle).duration_seconds
+    )
+    bridge.release_xfer_handle(handle)
+    bridge.release_dlist_handle(local_desc)
+    bridge.release_dlist_handle(remote_desc)
+    bridge.deregister_memory(registration)
+    second.unregister_memory(remote_registration)
+    bridge.remove_remote_agent(peer)
+
+
+@pytest.mark.parametrize("operation", ["READ", "WRITE"])
+def test_opt_in_worker_reuses_hma_registration_and_completion(
+    transports, monkeypatch, operation
+):
+    """Both opt-in modes run the existing hybrid planner and progress loop."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+        worker as legacy_worker,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.p2p import worker as p2p_worker
+
+    from . import test_nixl_desc_geometry as geometry
+
+    first, second = transports
+    worker_cls = (
+        p2p_worker.P2pPullConnectorWorker
+        if operation == "READ"
+        else p2p_worker.P2pPushConnectorWorker
+    )
+    monkeypatch.setattr(legacy_worker, "NixlConnectorWorker", worker_cls)
+    requested_operations = []
+
+    def create_transport(config, requested_operation):
+        requested_operations.append(requested_operation)
+        return first
+
+    monkeypatch.setattr(p2p_worker, "create_transport", create_transport)
+    worker = geometry._make_mla_hybrid_worker(32, 16, 4)
+    try:
+        assert requested_operations == [operation]
+        assert worker._has_mamba
+        local = worker.src_xfer_handles_by_block_size[worker.block_size]
+        address, length, _ = local.regions[0]
+        address, length = int(address), int(length)
+        ctypes.memset(address, 0x43, length)
+        remote_buffer = ctypes.create_string_buffer(b"Z" * length, length)
+        remote = first.prepare_descriptors(
+            second._peer.name, [(ctypes.addressof(remote_buffer), length, 0)]
+        )
+        handle = worker.nixl_wrapper.make_prepped_xfer(
+            operation, local, [0], remote, [0], b"request:1"
+        )
+        worker.nixl_wrapper.transfer(handle)
+        assert wait_done(first, handle) == TransferState.DONE
+        transfers = {"request": [handle]}
+        assert worker._pop_done_transfers(transfers) == {"request"}
+        assert transfers == {}
+        expected = (b"Z" if operation == "READ" else b"C") * length
+        assert ctypes.string_at(address, length) == remote_buffer.raw == expected
+        assert worker.xfer_stats.data["bytes_transferred"] == [length]
+    finally:
+        worker.shutdown()

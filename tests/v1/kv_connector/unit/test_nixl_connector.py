@@ -28,7 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     TransferTopology,
     get_current_attn_backend,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1 import p2p
+from vllm.distributed.kv_transfer.kv_connector.v1 import nixl
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
@@ -46,7 +46,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     compute_nixl_compatibility_hash,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.p2p.transport import TransferTelemetry
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown,
     has_kv_transfer_group,
@@ -342,7 +341,7 @@ def test_abort_immediately_remote_prefill_enqueues_empty_recv():
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_kv_transfer_handshake(dist_init):
@@ -449,7 +448,7 @@ def test_kv_transfer_handshake(dist_init):
         ) as mock_add_remote_agent:
             mock_add_remote_agent.return_type = "remote_agent"
 
-            decode_connector.connector_worker._p2p_handshake(
+            decode_connector.connector_worker._nixl_handshake(
                 kv_connector_metadata["remote_host"],
                 kv_connector_metadata["remote_port"],
                 kv_connector_metadata["tp_size"],
@@ -502,7 +501,7 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
             self.vllm_config, self.backend_name
         )
 
-    def _p2p_handshake(
+    def _nixl_handshake(
         self,
         host: str,
         port: int,
@@ -512,7 +511,7 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         remote_pp_size: int = 1,
         notif_agents_only: bool = False,
     ) -> tuple[dict[tuple[int, int], str], float]:
-        # Mimic slow _p2p_handshake, as well as bypass zmq communication.
+        # Mimic slow _nixl_handshake, as well as bypass zmq communication.
         time.sleep(self._hand_shake_latency)
         # These should've been done in register_kv_caches(), called by
         # gpu_model_runner. Here we just hardcode some dummy values.
@@ -569,7 +568,7 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
 class TestNixlHandshake:
     @pytest.mark.parametrize("pcp_rank", [0, 1])
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     def test_pcp_producer_uses_canonical_replica(
@@ -582,12 +581,12 @@ class TestNixlHandshake:
         vllm_config.parallel_config.prefill_context_parallel_size = 2
         with (
             patch(
-                "vllm.distributed.kv_transfer.kv_connector.v1.p2p."
+                "vllm.distributed.kv_transfer.kv_connector.v1.nixl."
                 "base_worker.get_current_attn_backends",
                 return_value=[FlashAttentionBackend],
             ),
             patch(
-                "vllm.distributed.kv_transfer.kv_connector.v1.p2p."
+                "vllm.distributed.kv_transfer.kv_connector.v1.nixl."
                 "base_worker.get_pcp_group"
             ) as mock_get_pcp_group,
         ):
@@ -622,7 +621,7 @@ class TestNixlHandshake:
         assert done_recving == set()
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     def test_multi_xfer_one_engine(
@@ -649,7 +648,7 @@ class TestNixlHandshake:
             hand_shake_latency=0,
             kv_cache_config=kv_cache_config,
         )
-        assert isinstance(connector.connector_worker.transport.agent, FakeNixlWrapper)
+        assert isinstance(connector.connector_worker.nixl_wrapper, FakeNixlWrapper)
         worker = connector.connector_worker
         # simulate handshake
         worker.dst_xfer_side_handles = {
@@ -705,7 +704,7 @@ class TestNixlHandshake:
             connector.clear_connector_metadata()
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     @pytest.mark.parametrize(
@@ -775,7 +774,7 @@ class TestNixlHandshake:
         raise TimeoutError("Took too long to complete async handshake.")
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     @pytest.mark.parametrize("local_tp_size", [1, 2])
@@ -787,7 +786,7 @@ class TestNixlHandshake:
         remote configurations.
         """
         monkeypatch.setattr(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker.get_tensor_model_parallel_world_size",
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",
             lambda: local_tp_size,
         )
 
@@ -829,7 +828,7 @@ class TestNixlHandshake:
                 range(tp_ratio)
             )
 
-        remote_agents, _ = worker._p2p_handshake(
+        remote_agents, _ = worker._nixl_handshake(
             host="localhost",
             port=1234,
             remote_tp_size=4,
@@ -841,7 +840,7 @@ class TestNixlHandshake:
         # discovered. This is not a scenario we actively support right now, but
         # the connector allows it.
         worker.REMOTE_ENGINE_ID = "remote_engine_2"
-        remote_agents, _ = worker._p2p_handshake(
+        remote_agents, _ = worker._nixl_handshake(
             host="localhost",
             port=1234,
             remote_tp_size=6,
@@ -850,7 +849,7 @@ class TestNixlHandshake:
         check_handshake(6)
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     def test_prefill_tp_size_greater_than_decode_tp_size_mla(
@@ -900,10 +899,10 @@ class TestNixlHandshake:
         # Simulate a read notification coming from D with (tp=1, dp=2).
         notif = f"{req_id}:{d_tp_size}".encode()
         # D0-0->P0 notif
-        conn_p0.connector_worker.transport.agent.get_new_notifs = lambda: {
+        conn_p0.connector_worker.nixl_wrapper.get_new_notifs = lambda: {
             "agent": [notif]
         }  # type: ignore[method-assign]
-        conn_p1.connector_worker.transport.agent.get_new_notifs = lambda: {
+        conn_p1.connector_worker.nixl_wrapper.get_new_notifs = lambda: {
             "agent": [notif]
         }  # type: ignore[method-assign]
 
@@ -953,7 +952,7 @@ class TestNixlHandshake:
         assert req_id not in conn_p1.connector_worker._reqs_to_process
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     def test_concurrent_load_kv(
@@ -1018,7 +1017,7 @@ class TestNixlHandshake:
         raise TimeoutError("Took too long to complete async handshake.")
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     def test_handshake_fails_on_kv_cache_layout_mismatch(
@@ -1033,7 +1032,7 @@ class TestNixlHandshake:
         # Mock TP world size to 2 to force heterogeneous TP when
         # remote_tp_size=1
         with patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
             return_value=2,
         ):
             # Initialize connector and worker (with fake NIXL wrapper)
@@ -1076,7 +1075,7 @@ class TestNixlHandshake:
                 worker.add_remote_agent(meta, remote_tp_size=1)
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     def test_handshake_succeed_on_kv_cache_layout_mismatch_with_experimental(
@@ -1091,7 +1090,7 @@ class TestNixlHandshake:
         # Mock TP world size to 2 to force heterogeneous TP when
         # remote_tp_size=1
         with patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
             return_value=2,
         ):
             # Initialize connector and worker (with fake NIXL wrapper)
@@ -1135,7 +1134,7 @@ class TestNixlHandshake:
             worker.add_remote_agent(meta, remote_tp_size=1)
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     def test_hybrid_mamba_attention_remote_descs_use_packed_head_slices(
@@ -1181,7 +1180,7 @@ class TestNixlHandshake:
         ]
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     def test_handshake_mixed_fa_mla_hetero_tp(self, default_vllm_config, dist_init):
@@ -1191,7 +1190,7 @@ class TestNixlHandshake:
         """
         vllm_config = create_vllm_config()
         with patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
             return_value=2,
         ):
             connector = NixlConnector(
@@ -1267,7 +1266,7 @@ class TestNixlHandshake:
                 worker2.add_remote_agent(bad_meta, remote_tp_size=1)
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     def test_handshake_validates_gqa_replicated_block_len(
@@ -1285,7 +1284,7 @@ class TestNixlHandshake:
         vllm_config = create_vllm_config()
 
         with patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
             return_value=16,
         ):
             connector = NixlConnector(
@@ -1328,7 +1327,7 @@ class TestNixlHandshake:
             worker.add_remote_agent(meta, remote_tp_size=8)
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     def test_handshake_rejects_wrong_block_len_without_gqa_replication(
@@ -1341,7 +1340,7 @@ class TestNixlHandshake:
         vllm_config = create_vllm_config()
 
         with patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
             return_value=4,
         ):
             connector = NixlConnector(
@@ -1390,7 +1389,7 @@ class TestNixlHandshake:
 # we put here is important. First run ray, it will clean up the resources, then
 # the rest of the tests.
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_kv_connector_stats(default_vllm_config, dist_init):
@@ -1525,7 +1524,7 @@ def test_kv_connector_stats_aggregation():
 
     # Record different transfers on each worker
     # Worker 1: 2 transfers
-    stats = TransferTelemetry(1, 1, 1, 1)
+    stats = get_default_xfer_telemetry()
     worker1_stats.record_transfer(stats)
     worker1_stats.record_transfer(stats)
 
@@ -1533,7 +1532,9 @@ def test_kv_connector_stats_aggregation():
     worker2_stats.record_transfer(stats)
 
     # Worker 3: 3 transfers
-    stats = TransferTelemetry(2, 2, 2, 2)
+    stats = get_default_xfer_telemetry(
+        xferDurationS=2, postDurationS=2, totalBytes=2, descCount=2
+    )
     worker3_stats.record_transfer(stats)
     worker3_stats.record_transfer(stats)
     worker3_stats.record_transfer(stats)
@@ -1607,7 +1608,7 @@ def test_multi_kv_connector_stats_aggregation():
         if nixl_count > 0:
             nixl_stats = NixlKVConnectorStats()
             for _ in range(nixl_count):
-                nixl_stats.record_transfer(TransferTelemetry(1, 1, 1, 1))
+                nixl_stats.record_transfer(get_default_xfer_telemetry())
             data["NixlConnector"] = nixl_stats
         if foo_count > 0:
             foo_stats = FooKVConnectorStats()
@@ -1649,7 +1650,7 @@ def test_multi_kv_connector_stats_aggregation():
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_scheduler_kv_connector_stats_aggregation():
@@ -1660,7 +1661,7 @@ def test_scheduler_kv_connector_stats_aggregation():
 
     # Worker stats with transfer metrics
     worker_stats = NixlKVConnectorStats()
-    worker_stats.record_transfer(TransferTelemetry(1, 1, 1, 1))
+    worker_stats.record_transfer(get_default_xfer_telemetry())
 
     # Scheduler stats with custom metric (needs dummy transfer to avoid being skipped)
     scheduler_stats = NixlKVConnectorStats()
@@ -1715,7 +1716,7 @@ def test_scheduler_kv_connector_stats_aggregation():
 
 @pytest.mark.parametrize("distributed_executor_backend", ["ray", None])
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_abort_timeout_on_prefiller(monkeypatch, distributed_executor_backend):
@@ -1908,11 +1909,9 @@ def test_register_kv_caches(
 
         backend_cls = TritonAttentionBackend
 
-    nixl_worker = "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker"
+    nixl_worker = "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker"
     with (
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper"
-        ) as mock_nixl_wrapper,
+        patch(f"{nixl_worker}.NixlWrapper") as mock_nixl_wrapper,
         patch(f"{nixl_worker}.threading.Event"),
         patch(f"{nixl_worker}.threading.Thread") as mock_thread,
         patch(f"{nixl_worker}.get_current_attn_backends") as mock_get_attn_backends,
@@ -1953,7 +1952,7 @@ def test_register_kv_caches(
 
         # Get the mock instance
         mock_wrapper_instance = mock_nixl_wrapper.return_value
-        connector.connector_worker.transport.agent = mock_wrapper_instance
+        connector.connector_worker.nixl_wrapper = mock_wrapper_instance
 
         # Appease NixlHandshakePayload encoding with some bytes
         mock_wrapper_instance.get_agent_metadata.return_value = b"fake_agent_metadata"
@@ -2050,11 +2049,9 @@ def test_register_packed_dsv4_mla_cache_as_single_region(
 ):
     from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 
-    nixl_worker = "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker"
+    nixl_worker = "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker"
     with (
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper"
-        ) as mock_nixl_wrapper,
+        patch(f"{nixl_worker}.NixlWrapper") as mock_nixl_wrapper,
         patch(f"{nixl_worker}.threading.Event"),
         patch(f"{nixl_worker}.threading.Thread") as mock_thread,
         patch(f"{nixl_worker}.get_current_attn_backends") as mock_backends,
@@ -2092,7 +2089,7 @@ def test_register_packed_dsv4_mla_cache_as_single_region(
             kv_cache_config=kv_cache_config,
         )
         wrapper = mock_nixl_wrapper.return_value
-        connector.connector_worker.transport.agent = wrapper
+        connector.connector_worker.nixl_wrapper = wrapper
         wrapper.get_agent_metadata.return_value = b"fake_agent_metadata"
         mock_thread.return_value.is_alive.return_value = False
 
@@ -2152,23 +2149,29 @@ def test_kv_buffer_to_nixl_memory_types(
     vllm_config = create_vllm_config()
     # Override the default memory types in the config
     vllm_config.kv_transfer_config.kv_buffer_device = kv_buffer_device
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+        _NIXL_SUPPORTED_DEVICE,
+    )
+
+    _NIXL_SUPPORTED_DEVICE.update(FakePlatform.get_nixl_supported_devices())
+
     with (
         patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper"
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper"
         ),
         patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker.threading.Event"
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.threading.Event"
         ),
         patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker.threading.Thread"
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.threading.Thread"
         ),
         patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker.current_platform",
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.current_platform",
             FakePlatform,
         ),
         patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.current_platform",
-            FakePlatform,
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils._NIXL_SUPPORTED_DEVICE",
+            _NIXL_SUPPORTED_DEVICE,
         ),
     ):  # noqa: E501
         # Create connector and replace its worker with a fake one for isolation
@@ -2178,11 +2181,11 @@ def test_kv_buffer_to_nixl_memory_types(
 
         # Verify get_reg_descs was called with the correct memory_type
         assert connector.connector_worker.kv_buffer_device == kv_buffer_device
-        assert connector.connector_worker.transport.memory_type == nixl_memory_type
+        assert connector.connector_worker.nixl_memory_type == nixl_memory_type
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
@@ -2199,11 +2202,11 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
         vllm_config.kv_transfer_config.engine_id,
         make_kv_cache_config(block_size=16),
     )
-    nixl_wrapper = worker.transport.agent
+    nixl_wrapper = worker.nixl_wrapper
 
     with (
         patch.object(worker, "_handshake_initiation_executor") as mock_exec,
-        patch.object(scheduler, "_p2p_handshake_listener_t") as mock_listener,
+        patch.object(scheduler, "_nixl_handshake_listener_t") as mock_listener,
         patch.object(nixl_wrapper, "release_xfer_handle") as mock_rel_xfer,
         patch.object(nixl_wrapper, "release_dlist_handle") as mock_rel_dlist,
         patch.object(nixl_wrapper, "remove_remote_agent") as mock_rem_agent,
@@ -2281,13 +2284,13 @@ def _setup_worker_with_remote_engine(
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_engine_ttl_eviction(default_vllm_config, dist_init):
     """Stale engines are evicted when TTL expires."""
     worker, engine_id = _setup_worker_with_remote_engine(engine_ttl=10.0)
-    nixl_wrapper = worker.transport.agent
+    nixl_wrapper = worker.nixl_wrapper
 
     with (
         patch.object(nixl_wrapper, "release_dlist_handle") as mock_rel,
@@ -2316,7 +2319,7 @@ def test_engine_ttl_eviction(default_vllm_config, dist_init):
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_engine_ttl_disabled(default_vllm_config, dist_init):
@@ -2366,7 +2369,7 @@ def test_transfer_topology_unregister():
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_aborted_request_removed_from_worker_in_batch(default_vllm_config, dist_init):
@@ -2486,7 +2489,7 @@ class FailingNixlWrapper(FakeNixlWrapper):
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FailingNixlWrapper,
 )
 @pytest.mark.parametrize(
@@ -2537,7 +2540,7 @@ def test_transfer_failure_logging(
 
     # Configure FailingNixlWrapper to fail in the specified way
     for key, value in wrapper_config.items():
-        setattr(connector.connector_worker.transport.agent, key, value)
+        setattr(connector.connector_worker.nixl_wrapper, key, value)
 
     request_id = f"test_{failure_type}_req"
 
@@ -2579,10 +2582,10 @@ def test_transfer_failure_logging(
     # Capture logs from the nixl connector loggers
     # vLLM loggers have propagate=False, so we need to capture directly
     nixl_logger = logging.getLogger(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_worker"
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker"
     )
     pull_logger = logging.getLogger(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.pull_worker"
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker"
     )
     captured_logs: list[logging.LogRecord] = []
 
@@ -2646,7 +2649,7 @@ def test_transfer_failure_logging(
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FailingNixlWrapper,
 )
 def test_handshake_failure_returns_finished(default_vllm_config, dist_init):
@@ -2659,7 +2662,7 @@ def test_handshake_failure_returns_finished(default_vllm_config, dist_init):
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config, connector.engine_id, hand_shake_latency=0.1
     )
-    connector.connector_worker.transport.agent.fail_handshake = True
+    connector.connector_worker.nixl_wrapper.fail_handshake = True
 
     request_id = "test_handshake_fail"
     metadata = NixlConnectorMetadata()
@@ -2697,7 +2700,7 @@ def test_handshake_failure_returns_finished(default_vllm_config, dist_init):
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FailingNixlWrapper,
 )
 def test_transfer_setup_failure_returns_finished(default_vllm_config, dist_init):
@@ -2711,7 +2714,7 @@ def test_transfer_setup_failure_returns_finished(default_vllm_config, dist_init)
     connector.connector_worker = FakeNixlConnectorWorker(
         vllm_config, connector.engine_id, hand_shake_latency=0
     )
-    connector.connector_worker.transport.agent.fail_transfer_setup = True
+    connector.connector_worker.nixl_wrapper.fail_transfer_setup = True
 
     request_id = "test_transfer_fail"
     metadata = NixlConnectorMetadata()
@@ -2751,7 +2754,7 @@ def test_transfer_setup_failure_returns_finished(default_vllm_config, dist_init)
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FailingNixlWrapper,
 )
 @pytest.mark.parametrize(
@@ -2809,7 +2812,7 @@ def test_failed_request_skips_kv_postprocessing(
         hand_shake_latency=0.1 if failure_mode == "handshake" else 0,
     )
     worker = connector.connector_worker
-    setattr(worker.transport.agent, _WRAPPER_CONFIG[failure_mode], True)
+    setattr(worker.nixl_wrapper, _WRAPPER_CONFIG[failure_mode], True)
 
     request_id = f"test_{failure_mode}_skip_postprocess"
     metadata = NixlConnectorMetadata()
@@ -3037,7 +3040,7 @@ def test_scheduler_advertises_transfer_mode():
     ],
 )
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_compatibility_hash_validation(
@@ -3105,8 +3108,8 @@ def test_compatibility_hash_validation(
         elif "connector_version" in version_override:
             stack.enter_context(
                 patch.object(
-                    p2p.metadata,
-                    "P2P_CONNECTOR_VERSION",
+                    nixl.metadata,
+                    "NIXL_CONNECTOR_VERSION",
                     version_override["connector_version"],
                 )
             )
@@ -3147,20 +3150,20 @@ def test_compatibility_hash_validation(
     # Patch zmq_ctx to return our mock socket
     with (
         patch.object(decode_worker, "add_remote_agent", return_value="fake_agent"),
-        patch.object(p2p.base_worker, "zmq_ctx") as mock_zmq_ctx,
+        patch.object(nixl.base_worker, "zmq_ctx") as mock_zmq_ctx,
     ):
         mock_zmq_ctx.return_value.__enter__.return_value = mock_socket
 
         if should_fail:
             with pytest.raises(RuntimeError, match="compatibility hash mismatch"):
-                decode_worker._p2p_handshake(
+                decode_worker._nixl_handshake(
                     host="localhost",
                     port=1234,
                     remote_tp_size=1,
                     expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
                 )
         else:
-            result, _ = decode_worker._p2p_handshake(
+            result, _ = decode_worker._nixl_handshake(
                 host="localhost",
                 port=1234,
                 remote_tp_size=1,
@@ -3181,7 +3184,7 @@ def test_compatibility_hash_validation(
     ],
 )
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario):
@@ -3248,12 +3251,12 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
     ]
     with (
         patch.object(decode_worker, "add_remote_agent", return_value="fake_agent"),
-        patch.object(p2p.base_worker, "zmq_ctx") as mock_zmq_ctx,
+        patch.object(nixl.base_worker, "zmq_ctx") as mock_zmq_ctx,
     ):
         mock_zmq_ctx.return_value.__enter__.return_value = mock_socket
 
         with pytest.raises(RuntimeError):
-            decode_worker._p2p_handshake(
+            decode_worker._nixl_handshake(
                 host="localhost",
                 port=1234,
                 remote_tp_size=1,
@@ -3261,7 +3264,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
             )
 
     @patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
     def test_mla_broadcast_notif_uses_remote_request_id(
@@ -3298,7 +3301,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
 
         # Manually register the remote (P) engine and pre-populate the
         # per-rank state the handshake would normally fill in. The real
-        # `_p2p_handshake` is unnecessary here — we only need
+        # `_nixl_handshake` is unnecessary here — we only need
         # `transfer_topo` to know `remote_tp_size`, and `_remote_agents`
         # / `dst_xfer_side_handles` to be keyed by remote rank.
         remote_engine_id = "remote_engine"
@@ -3344,7 +3347,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
         # auto-notif via `make_prepped_xfer`, not via `send_notif`, so
         # any captured `send_notif` here is a broadcast.
         send_notif_calls: list[tuple[str, bytes]] = []
-        worker.transport.agent.send_notif = (  # type: ignore[method-assign]
+        worker.nixl_wrapper.send_notif = (  # type: ignore[method-assign]
             lambda agent_name, notif_msg: send_notif_calls.append(
                 (agent_name, notif_msg)
             )
@@ -3381,7 +3384,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_kv_both_deprecation_warning(default_vllm_config, dist_init):
@@ -3393,7 +3396,7 @@ def test_kv_both_deprecation_warning(default_vllm_config, dist_init):
     vllm_config = create_vllm_config(kv_role="kv_both")
 
     with patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.p2p.connector.logger"
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector.logger"
     ) as mock_logger:
         mock_logger.warning_once = mock_logger.warning_once
         NixlConnector(
@@ -3409,7 +3412,7 @@ def test_kv_both_deprecation_warning(default_vllm_config, dist_init):
 
 
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
 def test_explicit_kv_role_no_deprecation_warning(default_vllm_config, dist_init):
@@ -3417,7 +3420,7 @@ def test_explicit_kv_role_no_deprecation_warning(default_vllm_config, dist_init)
     for role in ("kv_consumer", "kv_producer"):
         vllm_config = create_vllm_config(kv_role=role)
         with patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.connector.logger"
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector.logger"
         ) as mock_logger:
             NixlConnector(
                 vllm_config,

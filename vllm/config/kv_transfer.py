@@ -135,7 +135,6 @@ class KVTransferConfig:
             self.has_connector(name)
             for name in (
                 "NixlConnector",
-                "NixlPullConnector",
                 "P2pConnector",
                 "P2pPullConnector",
                 "MooncakePullConnector",

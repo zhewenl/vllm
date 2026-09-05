@@ -35,7 +35,7 @@ from .utils import (
     ],
 )
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_scheduler.current_platform"
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler.current_platform"
 )
 def test_sw_sizes(mock_platform, swa_enabled, expected_sw_sizes):
     """Test sw_sizes is correctly computed based on SWA enabled/disabled."""
@@ -292,10 +292,10 @@ def test_sync_device_after_mamba_recv_gates(
     expected_syncs,
 ):
     """Only direct-GPU Mamba receives on ROCm need a device fence."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
     )
-    from vllm.distributed.kv_transfer.kv_connector.v1.p2p import base_worker
 
     worker = object.__new__(NixlConnectorWorker)
     worker._has_mamba = has_mamba
@@ -1288,7 +1288,7 @@ def test_mamba_n1_p_side_truncation():
     ids=["fa_swa_mamba", "fa_swa_only", "fa_only"],
 )
 @patch(
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_scheduler.current_platform"
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler.current_platform"
 )
 def test_has_mamba_init(
     mock_platform,
@@ -1736,10 +1736,10 @@ def test_register_kv_caches_hybrid_mla_dual_purpose_regions():
     from unittest.mock import MagicMock
 
     from vllm.config import set_current_vllm_config
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
     )
-    from vllm.distributed.kv_transfer.kv_connector.v1.p2p import base_worker as bw
 
     kv_cache_config = _make_hybrid_mla_kv_cache_config()
     unified_page = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
@@ -1759,17 +1759,11 @@ def test_register_kv_caches_hybrid_mla_dual_purpose_regions():
     fake_platform.get_nixl_memory_type.return_value = "VRAM"
 
     with (
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.NixlWrapper"
-        ),
+        patch.object(bw, "NixlWrapper"),
         patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
         patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
         patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
         patch.object(bw, "current_platform", fake_platform),
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.p2p.transports.nixl.current_platform",
-            fake_platform,
-        ),
         patch(
             "vllm.model_executor.layers.mamba.mamba_utils.get_conv_state_layout",
             return_value="DS",
@@ -1778,7 +1772,7 @@ def test_register_kv_caches_hybrid_mla_dual_purpose_regions():
     ):
         worker = NixlConnectorWorker(vllm_config, "test-engine", kv_cache_config)
         worker.use_mla = True  # opt-125m test config is not MLA; force the flag
-        worker.transport.agent.get_agent_metadata.return_value = b"fake-agent-metadata"
+        worker.nixl_wrapper.get_agent_metadata.return_value = b"fake-agent-metadata"
 
         tensors = [torch.zeros(4 * unified_page, dtype=torch.uint8) for _ in range(2)]
         # KDA layer first per tensor: exercises the dual-purpose flag merge.

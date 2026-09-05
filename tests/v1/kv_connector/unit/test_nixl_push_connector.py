@@ -14,7 +14,7 @@ requiring a real NIXL agent or network:
   ``finished_recving``.
 * The worker matches D registrations against P finished blocks (both
   scenario directions) and forwards non-PUSH_REG NIXL notifs to the main
-  thread's ``_get_notifications``.
+  thread's ``_get_new_notifs``.
 * ``get_finished`` enqueues evictions for the writer.
 """
 
@@ -345,7 +345,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._push_writer_stop = threading.Event()
         w._push_writer_thread = None
 
-        # Base worker fields touched by start_load_kv / _get_notifications.
+        # Base worker fields touched by start_load_kv / _get_new_notifs.
         w._recving_metadata = {}
         w._recving_transfers = defaultdict(list)
         w._reqs_to_process = set()
@@ -630,8 +630,8 @@ def test_writer_loop_drains_deferred_push_inbox():
     """The writer loop drains ``_deferred_push_inbox`` and re-drives
     ``_do_start_push_kv`` for each entry (event-driven, no polling)."""
     w = _StubWriterWorker.fresh()
-    w.transport = MagicMock()
-    w.transport.get_notifications.return_value = {}
+    w.nixl_wrapper = MagicMock()
+    w.nixl_wrapper.get_new_notifs.return_value = {}
 
     processed = threading.Event()
 
@@ -668,7 +668,7 @@ def _eviction_worker(engine_ttl: float) -> NixlPushConnectorWorker:
     w._engine_clock_offset = {}
     w._handshake_lock = threading.RLock()
     # _cleanup_remote_engine touches these when reaping an engine.
-    w.transport = MagicMock()
+    w.nixl_wrapper = MagicMock()
     w.dst_xfer_side_handles = {}
     w.kv_caches_base_addr = {}
     w.dst_num_blocks = {}
@@ -710,13 +710,13 @@ def test_stale_engine_evicted_on_push():
 
     assert "D-old" not in w._remote_agents
     assert "D-old" not in w._engine_last_active
-    w.transport.disconnect_peer.assert_called_once_with("agent-D-old")
+    w.nixl_wrapper.remove_remote_agent.assert_called_once_with("agent-D-old")
 
 
 class TestPushWriterNotifs:
-    def test_get_notifications_processes_forwarded_completion_notif(self):
+    def test_get_new_notifs_processes_forwarded_completion_notif(self):
         """Non-PUSH_REG notifs forwarded by the writer thread are drained
-        on the engine main thread inside ``_get_notifications``."""
+        on the engine main thread inside ``_get_new_notifs``."""
         w = _StubWriterWorker.fresh()
         # Pretend the writer thread already forwarded a completion notif
         # for a request whose KV is being received.
@@ -730,7 +730,7 @@ class TestPushWriterNotifs:
         # make it a MagicMock because the D-side branch returns early.
         w.transfer_topo = MagicMock()
 
-        notified = w._get_notifications()
+        notified = w._get_new_notifs()
 
         # Notif consumed; D-side just touches _recving_transfers.
         assert notified == set()
@@ -961,7 +961,7 @@ class TestPushWriterNegative:
         # Wake set so the writer drains NIXL notifs even when idle.
         assert w._push_writer_wake.is_set()
 
-    def test_get_notifications_unknown_request_is_logged_and_skipped(self, caplog):
+    def test_get_new_notifs_unknown_request_is_logged_and_skipped(self, caplog):
         """A completion notif for a request the worker doesn't know
         about should be logged but not crash."""
         caplog.set_level(
@@ -973,7 +973,7 @@ class TestPushWriterNegative:
         # Forward a completion notif for an unknown request_id.
         w._pending_completion_notifs.put(b"never-heard-of-you:1")
 
-        notified = w._get_notifications()
+        notified = w._get_new_notifs()
         assert notified == set()
         # Did not register anywhere.
         assert "never-heard-of-you" not in w._recving_transfers
@@ -992,7 +992,7 @@ class TestPushWriterNegative:
         # Wake should NOT be set if there was nothing to push.
         assert not w._push_writer_wake.is_set()
 
-    def test_get_notifications_extends_lease_on_heartbeat(self):
+    def test_get_new_notifs_extends_lease_on_heartbeat(self):
         """``HB:`` notifs forwarded by the writer thread must extend the
         leases of tracked P-side requests on the engine main thread, and
         ignore request IDs that aren't being tracked."""
@@ -1011,7 +1011,7 @@ class TestPushWriterNegative:
         # and another tracked one.
         w._pending_completion_notifs.put(b"HB:req-a,req-unknown,req-b")
 
-        notified = w._get_notifications()
+        notified = w._get_new_notifs()
         assert notified == set()
 
         # Tracked leases were renewed strictly forward in time.
@@ -1044,13 +1044,13 @@ class TestPushPipelineParallel:
 
         # First stage: counted, not yet done.
         w._pending_completion_notifs.put(notif)
-        assert w._get_notifications() == set()
+        assert w._get_new_notifs() == set()
         assert request_id not in w._recving_transfers
         assert w.consumer_notification_counts_by_req[request_id] == 1
 
         # Second (final) stage: now reported done.
         w._pending_completion_notifs.put(notif)
-        assert w._get_notifications() == set()
+        assert w._get_new_notifs() == set()
         assert request_id in w._recving_transfers
         assert request_id not in w.consumer_notification_counts_by_req
 
@@ -1085,7 +1085,7 @@ class TestPushPipelineParallel:
         w.pp_size = 2
         w._remote_region_offset = 2  # this worker owns layers [2, 4)
         w.block_len_per_layer = [block_len, block_len]  # 2 local layers
-        w.transport = MagicMock()
+        w.nixl_wrapper = MagicMock()
 
         class _StopAfterSlice(RuntimeError):
             pass
@@ -1134,7 +1134,7 @@ class TestPushWriterMlaReplication:
         engine_id = "decode-engine"
         w = _StubWriterWorker.fresh()
         w.use_mla = True
-        w.transport = MagicMock()
+        w.nixl_wrapper = MagicMock()
         w.transfer_topo = MagicMock()
         w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
             remote_tp_size=len(d_ranks),
@@ -1194,7 +1194,7 @@ class TestPushWriterMlaReplication:
         # Every handshook D rank must receive a real WRITE of the latent...
         assert sorted(written) == [0, 1]
         # ...and no rank may be fobbed off with a bare completion notif.
-        assert w.transport.send_notification.call_count == 0
+        assert w.nixl_wrapper.send_notif.call_count == 0
         # All of the request's WRITE handles must be tracked together, so the
         # engine thread never sees a partial set and double-frees the request.
         assert sorted(w._sending_transfers["p-req"]) == [1000, 1001]
@@ -1216,7 +1216,7 @@ class TestPushWriterMlaReplication:
         w.use_mla = False
         w._has_mamba = True
         w._is_csa_linear = True
-        w.transport = MagicMock()
+        w.nixl_wrapper = MagicMock()
         w.transfer_topo = MagicMock()
         w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
             remote_tp_size=4,
@@ -1319,8 +1319,8 @@ class TestPushPrefixCaching:
 
         # Stub only the NIXL WRITE; kernel expansion, prefix-cache trim, desc
         # computation and count assertions all run for real.
-        w.transport = MagicMock()
-        w.transport.create_transfer.return_value = 7
+        w.nixl_wrapper = MagicMock()
+        w.nixl_wrapper.make_prepped_xfer.return_value = 7
         w._ensure_handshake = lambda *a, **k: None
         w._logical_to_kernel_block_ids = lambda x, ratio: x
         return w, engine_id
@@ -1328,7 +1328,7 @@ class TestPushPrefixCaching:
     @staticmethod
     def _written_block_ids(w) -> tuple[list[int], list[int]]:
         """Return the (local, remote) block IDs handed to the NIXL WRITE."""
-        args, _ = w.transport.create_transfer.call_args
+        args, _ = w.nixl_wrapper.make_prepped_xfer.call_args
         # ("WRITE", local_handle, local_descs, remote_handle, remote_descs)
         return list(args[2]), list(args[4])
 

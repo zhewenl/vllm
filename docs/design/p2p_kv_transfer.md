@@ -1,45 +1,49 @@
 # Transfer-engine-agnostic P/D connectors
 
-`P2pPullConnector` and `P2pPushConnector` implement the P/D protocol once, with
-NIXL and native Mooncake as interchangeable transfer implementations. The
-runtime is extracted from the NIXL connector, including its scheduler, worker,
-metadata, descriptor geometry, completion accounting and metrics.
+The existing `NixlConnector`, `NixlPullConnector` and `NixlPushConnector`
+implementations remain in `v1/nixl/`. Their default configuration, imports,
+metadata and native NIXL execution path are preserved. No protocol files are
+moved or replaced with aliases.
 
-## Boundaries
+The new `P2pPullConnector` and `P2pPushConnector` are opt-in entry points. They
+reuse the existing NIXL scheduler and worker through inheritance, with a small
+bridge to an engine-independent `TransferTransport` interface. Native Mooncake
+READ and WRITE therefore reuse the same HMA/SSM geometry, TP mapping, prefix
+handling, leases and metrics without duplicating that protocol code.
+
+## Boundaries and compatibility
 
 ```mermaid
 flowchart TD
-    S[vLLM scheduler and model runner] --> P[Shared pull / push protocol]
-    P --> G[KV groups, TP mapping, byte-range descriptors]
-    P --> L[Leases, heartbeats, completion, failure accounting]
-    P --> M[Shared statistics and Prometheus]
-    G --> T[TransferTransport]
-    L --> T
+    Old[Existing NixlConnector entry points] --> R[Existing protocol in v1/nixl]
+    New[Opt-in P2p / Mooncake entry points] --> R
+    R -->|existing configuration| NX[Native NIXL wrapper]
+    R -->|opt-in worker factory| B[TransferAgentBridge]
+    B --> T[TransferTransport]
     T --> N[NixlTransport]
     T --> C[MooncakeTransport]
-    N --> NX[NIXL agent]
+    N --> NX
     C --> MC[Native Mooncake TransferEngine]
 ```
 
-The transport only knows local/remote byte ranges, opaque peer metadata and
-opaque notification payloads. It does not know requests, layers, attention
-backends, HMA groups or tensor-parallel ranks. Changes to GQA replication,
-Mamba/GDN convolution slicing, prefix hits or scheduler lifetimes belong above
-this boundary and apply to both engines.
+Changes to existing NIXL code are limited to worker factory/hash extension
+hooks, propagation of an unsafe-transfer error, and an optional metrics prefix
+whose default remains `nixl`. Existing scheduling, geometry and lifecycle code
+stays in its original files, and existing NIXL tests keep their original imports
+and mocks.
 
-| Responsibility | Shared protocol | Engine adapter |
-| --- | --- | --- |
-| Scheduling and request/block ownership | Pull and push state machines | None |
-| HMA, sliding windows, SSM and heterogeneous TP | Group mapping and descriptor generation | Transfer the selected byte ranges |
-| Handshake | Model/layout/mode/engine compatibility and topology | Export/connect opaque engine metadata |
-| Completion and leases | Expected sender/consumer counts, heartbeat payloads, expiry | Transfer completion and byte notifications |
-| Metrics | Aggregation, histograms, failure/expiry counters | Normalize native telemetry to seconds and bytes |
-| Memory | KV allocation and buffer lifetime | Register/unregister and prepare descriptors |
+`p2p/legacy.py` translates the existing wrapper method names, registration
+metadata, local-agent sentinel and telemetry units to `TransferTransport`.
+This bridge is only used by the new entry points. The transport itself knows
+byte ranges, opaque peer metadata and binary notifications; it does not know
+requests, layers, HMA groups or TP ranks.
 
-A planner regression test is shared across engines. A backend contract test
-covers byte movement, completion visibility and resource lifetime. Engine
-adapters are loaded only when a worker constructs its transport; selecting
-Mooncake does not require installing NIXL.
+This is an incremental migration boundary. The new connectors still inherit
+the existing runtime's platform/layout restrictions and NIXL-named internal
+helpers. Once native-engine compatibility and performance are validated, a
+later change can move the protocol into a neutral directory and remove the
+bridge. Such a move is not needed for fixes in the current protocol to be
+shared: both paths already execute those same methods.
 
 ## Transport contract
 
@@ -111,7 +115,9 @@ set `transfer_engine` to `nixl`. This default preserves existing NIXL deployment
 | `MooncakePullConnector` | READ / pull | Mooncake |
 | `MooncakePushConnector` | WRITE / push | Mooncake |
 
-The NIXL names and import paths remain compatibility aliases. The default NIXL
+The NIXL names and import paths retain their original implementations. Existing
+NIXL entry points continue selecting the native wrapper; select a new P2p or
+Mooncake entry point to opt in to `transfer_engine`. The default NIXL
 compatibility hash retains its existing factors and wire version. Different
 engines or transfer directions are rejected during handshake; engine-agnostic
 implementation does not imply NIXL-to-Mooncake wire interoperability.
@@ -164,8 +170,9 @@ worker before its last metrics batch is published.
 
 `test_p2p_transport.py` checks real byte copies through an in-process native API
 stand-in, notification ordering, nonblocking polling, unsafe failures and actual
-Prometheus samples. Existing NIXL suites exercise the shared protocol and HMA
-geometry through the compatibility aliases.
+Prometheus samples. Unmodified NIXL suites exercise the existing protocol and HMA geometry. New
+tests check that the native entry points still select the original classes and
+wrapper factory, and that the bridge preserves byte movement and telemetry.
 
 Hardware validation is also required: run pull and push with each native
 engine, compare deterministic completions against a colocated baseline, run the

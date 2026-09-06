@@ -431,6 +431,7 @@ class PullReqMeta:
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
     pull_tasks_count: int = 0
+    failed: bool = False
 
 
 @dataclass
@@ -872,6 +873,7 @@ class MooncakeConnectorScheduler:
             request.status,
             params,
         )
+        self._reqs_need_recv.pop(request.request_id, None)
         if not params or not params.get("transfer_id"):
             return False, None
 
@@ -1031,13 +1033,7 @@ class MooncakeConnectorWorker:
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
 
-        # Failed receives, surfaced to the scheduler so affected requests
-        # complete instead of hanging in WAITING_FOR_REMOTE_KVS.
-        self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
         self._invalid_block_ids: queue.Queue[set[int]] = queue.Queue()
-        # Each failed request is reported once, no matter how many of its
-        # (multi-rank) pull tasks report the failure.
-        self._reported_failed_recv: set[ReqId] = set()
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
@@ -1846,24 +1842,13 @@ class MooncakeConnectorWorker:
         finished_recving_reqs = recv_fut.result() if recv_fut else set()
         finished_sending_reqs = send_fut.result() if send_fut else set()
 
-        # Surface failed receives to the scheduler (the failed blocks are
-        # reported separately via get_block_ids_with_load_errors).
-        failed_recv_reqs: set[ReqId] = set()
-        while not self._failed_recv_reqs.empty():
-            try:
-                failed_recv_reqs.add(self._failed_recv_reqs.get_nowait())
-            except queue.Empty:
-                break
-        finished_recving_reqs |= failed_recv_reqs
-
         if finished_sending_reqs or finished_recving_reqs:
             logger.debug(
                 "Rank %s, get_finished: %s requests done sending "
-                "and %s requests done recving (%s failed)",
+                "and %s requests done recving",
                 self.tp_rank,
                 len(finished_sending_reqs),
                 len(finished_recving_reqs),
-                len(failed_recv_reqs),
             )
 
         return finished_sending_reqs or None, finished_recving_reqs or None
@@ -1941,10 +1926,13 @@ class MooncakeConnectorWorker:
                         )
                         self.xfer_stats.record_failed_recv()
                         for pull_meta in pull_metas.values():
-                            self._handle_failed_transfer(pull_meta)
+                            self._finish_pull(pull_meta, failed=True)
                         return
                     self.process_pulling_result(response, pull_metas)
                     if response.status == MooncakeXferResponseStatus.FINISH:
+                        # A terminal reply must account for every pending request.
+                        for pull_meta in pull_metas.values():
+                            self._finish_pull(pull_meta, failed=True)
                         break
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting Mooncake receiver thread.")
@@ -1952,50 +1940,32 @@ class MooncakeConnectorWorker:
             logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
             self.xfer_stats.record_failed_recv()
             for pull_meta in pull_metas.values():
-                self._handle_failed_transfer(pull_meta)
+                self._finish_pull(pull_meta, failed=True)
             return
 
-    def _handle_failed_transfer(self, pull_meta: PullReqMeta):
-        """Report a failed receive so the scheduler can complete the request
-        instead of leaving it in WAITING_FOR_REMOTE_KVS forever.
-
-        Mirrors NixlConnector: the request's group-0 blocks are reported as
-        invalid so the scheduler recomputes or fails it (skipped under HMA,
-        where the invalid-block path does not support multi-group models yet,
-        see https://github.com/vllm-project/vllm/issues/50687). When invalid
-        blocks cannot be reported, the request is merged into the
-        finished-recving set instead. The two channels are mutually
-        exclusive: reporting both would make the scheduler finish the request
-        via the invalid-block path and then trip its
-        `assert req_id in self.requests` on the finished-recving duplicate.
-        """
-        if pull_meta.d_req_id in self._reported_failed_recv:
+    def _finish_pull(self, pull_meta: PullReqMeta, *, failed: bool = False):
+        """Complete one producer's pull; report after all writers have stopped."""
+        pull_meta.failed |= failed
+        pull_meta.pull_tasks_count -= 1
+        if pull_meta.pull_tasks_count or not any(pull_meta.local_block_ids):
             return
-        self._reported_failed_recv.add(pull_meta.d_req_id)
-        if pull_meta.local_block_ids and not self._is_hma_required:
+        if pull_meta.failed and not self._is_hma_required:
             self._invalid_block_ids.put(set(pull_meta.local_block_ids[0]))
-        else:
-            self._failed_recv_reqs.put(pull_meta.d_req_id)
+        # Invalid blocks select fail/recompute; completion releases the async
+        # receive's block lease. The scheduler needs both signals on failure.
+        self.finished_recving_reqs.add(pull_meta.d_req_id)
 
     def process_pulling_result(
         self,
         response: MooncakeXferResponse,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
-        ok_reqs: list[ReqId] = response.ok_reqs or []
+        for req_id in response.ok_reqs or ():
+            if (pull_meta := pull_metas.pop(req_id, None)) is not None:
+                self._finish_pull(pull_meta)
 
-        for req_id in ok_reqs:
-            pull_meta = pull_metas[req_id]
-            # No race because we are in async loop.
-            pull_meta.pull_tasks_count -= 1
-            if (
-                pull_meta.pull_tasks_count == 0
-                and pull_meta.d_req_id not in self._reported_failed_recv
-            ):
-                self.finished_recving_reqs.add(pull_meta.d_req_id)
-
-        if ok_reqs:
-            logger.debug("pulling kv_caches for %s finished", ok_reqs)
+        if response.ok_reqs:
+            logger.debug("pulling kv_caches for %s finished", response.ok_reqs)
 
         if response.err_reqs:
             logger.error(
@@ -2004,8 +1974,8 @@ class MooncakeConnectorWorker:
                 response.err_msg,
             )
             for req_id in response.err_reqs:
-                if (pull_meta := pull_metas.get(req_id)) is not None:
-                    self._handle_failed_transfer(pull_meta)
+                if (pull_meta := pull_metas.pop(req_id, None)) is not None:
+                    self._finish_pull(pull_meta, failed=True)
 
     async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
         url = remote_bootstrap_addr + "/query"
@@ -2066,7 +2036,9 @@ class MooncakeConnectorWorker:
             pull_meta.pull_tasks_count = count
         for worker_addr in worker_addrs:
             asyncio.create_task(
-                self.receive_kv_from_single_worker(worker_addr, pull_metas)
+                # Track pending requests per connection; completed requests must
+                # not be failed again if a later receive in the batch errors.
+                self.receive_kv_from_single_worker(worker_addr, pull_metas.copy())
             )
 
     async def handle_new_engine_id(
@@ -2087,6 +2059,9 @@ class MooncakeConnectorWorker:
                 remote_engine_id,
                 remote_bootstrap_addr,
             )
+            for pull_meta in pull_metas.values():
+                pull_meta.pull_tasks_count = 1
+                self._finish_pull(pull_meta, failed=True)
             return
 
         self.receive_kv(remote_engine_id, pull_metas)
@@ -2103,29 +2078,10 @@ class MooncakeConnectorWorker:
                 self.receive_kv(remote_engine_id, pull_metas)
 
     async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
-        # This coroutine is fire-and-forget (run_coroutine_threadsafe), so it
-        # must never raise: an exception would be silently dropped and every
-        # unprocessed transfer_id in the batch would wedge consumer pulls
-        # waiting on `ready` until the abort timeout.
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
-                send_meta = self.reqs_need_send.get(transfer_id)
-                if send_meta is None:
-                    # The alloc-time placeholder is missing; recreate it so
-                    # the request can still rendezvous with a consumer pull.
-                    logger.warning(
-                        "Recreating missing send entry for request %s (transfer_id=%s)",
-                        p_req_id,
-                        transfer_id,
-                    )
-                    send_meta = SendBlockMeta(
-                        p_req_id=p_req_id,
-                        transfer_id=transfer_id,
-                        local_block_ids=[],
-                        ready=asyncio.Event(),
-                    )
-                    self.reqs_need_send[transfer_id] = send_meta
+                send_meta = self.reqs_need_send[transfer_id]
                 send_meta.p_req_id = p_req_id
                 send_meta.local_block_ids = block_ids
                 send_meta.expire_time = (
@@ -2145,13 +2101,9 @@ class MooncakeConnectorWorker:
                         ready=asyncio.Event(),
                     )
         for transfer_id in metadata.reqs_not_processed:
-            send_meta = self.reqs_need_send.pop(transfer_id, None)
-            if send_meta is not None and send_meta.ready.is_set():
-                logger.warning(
-                    "Dropping an already-ready send entry (transfer_id=%s); "
-                    "any in-flight consumer pull will time out and fail over.",
-                    transfer_id,
-                )
+            send_meta = self.reqs_need_send.pop(transfer_id)
+            if send_meta:
+                assert not send_meta.ready.is_set()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if not self.is_kv_producer and metadata.reqs_to_recv:

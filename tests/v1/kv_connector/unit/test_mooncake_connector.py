@@ -41,7 +41,12 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import RequestStatus
 
-from .utils import create_request, create_scheduler, create_vllm_config
+from .utils import (
+    create_model_runner_output,
+    create_request,
+    create_scheduler,
+    create_vllm_config,
+)
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
@@ -1402,3 +1407,183 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
 
         prefill_worker.sender_loop = origin_sender_loop
         prefill_worker.shutdown()
+
+
+@pytest.fixture
+def consumer_worker():
+    config = create_vllm_config(kv_connector="MooncakeConnector", kv_role="kv_consumer")
+    with set_current_vllm_config(config), patch_worker_dependencies() as mocks:
+        connector = MooncakeConnector(
+            config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        )
+        try:
+            yield connector.connector_worker, mocks
+        finally:
+            connector.connector_worker.shutdown()
+
+
+def _pull_meta(req_id="d-req", blocks=None, count=1):
+    return PullReqMeta(
+        d_req_id=req_id,
+        transfer_id=f"xfer-{req_id}",
+        local_block_ids=[[100, 101]] if blocks is None else blocks,
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+        pull_tasks_count=count,
+    )
+
+
+@pytest.mark.parametrize("failed_rank", [None, 0, 3])
+def test_receive_waits_for_all_producers_and_reports_once(consumer_worker, failed_rank):
+    """Do not release blocks while sibling producers can still write them."""
+    worker, _ = consumer_worker
+    meta = _pull_meta(count=4)
+    for rank in range(4):
+        pending = {meta.d_req_id: meta}
+        response = MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH,
+            ok_reqs=[] if rank == failed_rank else [meta.d_req_id],
+            err_reqs=[meta.d_req_id] if rank == failed_rank else [],
+        )
+        worker.process_pulling_result(response, pending)
+        # A repeated result from this connection cannot decrement twice.
+        worker.process_pulling_result(response, pending)
+        _, received = worker.get_finished()
+        invalid = worker.get_block_ids_with_load_errors()
+        assert received == ({meta.d_req_id} if rank == 3 else None)
+        assert invalid == (
+            {100, 101} if rank == 3 and failed_rank is not None else set()
+        )
+    assert worker.get_finished() == (None, None)
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+@pytest.mark.parametrize("blocks", [[], [[]], [[], []]])
+@pytest.mark.parametrize("failed", [False, True])
+def test_empty_pull_never_reports_receive_completion(consumer_worker, blocks, failed):
+    """Abort cleanup and full local prefix hits have no async block lease."""
+    worker, _ = consumer_worker
+    meta = _pull_meta(blocks=blocks)
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH,
+            ok_reqs=[] if failed else [meta.d_req_id],
+            err_reqs=[meta.d_req_id] if failed else [],
+        ),
+        {meta.d_req_id: meta},
+    )
+    assert worker.get_finished() == (None, None)
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["error", "exception", "incomplete_finish"])
+async def test_batch_error_does_not_refail_completed_requests(
+    consumer_worker, terminal
+):
+    """A later connection failure must only fail outstanding batch entries."""
+    worker, mocks = consumer_worker
+    complete = _pull_meta("complete", [[10]])
+    pending = _pull_meta("pending", [[20]])
+    first = worker._encoder.encode(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.CONTINUE, ok_reqs=["complete"]
+        )
+    )
+    last = (
+        RuntimeError("connection lost")
+        if terminal == "exception"
+        else worker._encoder.encode(
+            MooncakeXferResponse(
+                status=(
+                    MooncakeXferResponseStatus.ERROR
+                    if terminal == "error"
+                    else MooncakeXferResponseStatus.FINISH
+                )
+            )
+        )
+    )
+    mocks["mock_socket_object"].recv.side_effect = [first, last]
+    await worker.receive_kv_from_single_worker(
+        "tcp://producer:1234", {"complete": complete, "pending": pending}
+    )
+    assert worker.get_finished()[1] == {"complete", "pending"}
+    assert worker.get_block_ids_with_load_errors() == {20}
+    assert worker.get_finished() == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_failure_completes_pending_receive(consumer_worker):
+    worker, mocks = consumer_worker
+    mocks["mock_async_client"].return_value.__aenter__.side_effect = RuntimeError(
+        "bootstrap unavailable"
+    )
+    meta = _pull_meta(count=0)
+    await worker.handle_new_engine_id("p-engine", {meta.d_req_id: meta})
+    assert worker.get_finished()[1] == {meta.d_req_id}
+    assert worker.get_block_ids_with_load_errors() == {100, 101}
+    assert not worker._pending_bootstrap_queries
+
+
+@pytest.mark.parametrize("policy", ["fail", "recompute"])
+@pytest.mark.parametrize("abort", [False, True])
+def test_failed_receive_with_unmodified_scheduler(consumer_worker, policy, abort):
+    """Both failure channels must release or reschedule a real async request."""
+    worker, _ = consumer_worker
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_load_failure_policy=policy
+    )
+    scheduler = create_scheduler(config)
+    request = create_request(request_id=1, num_tokens=40, do_remote_prefill=True)
+    request.kv_transfer_params.update(
+        transfer_id=request.request_id, remote_bootstrap_addr="http://bootstrap:33333"
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    meta = output.kv_connector_metadata.reqs_to_recv["my-engine-id"][request.request_id]
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    meta.pull_tasks_count = 1
+    if abort:
+        scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+        assert request.request_id in scheduler.requests  # Blocks still leased.
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH, err_reqs=[request.request_id]
+        ),
+        {request.request_id: meta},
+    )
+    scheduler.update_from_output(
+        output,
+        create_model_runner_output(
+            [],
+            finished_recving=worker.get_finished()[1],
+            invalid_block_ids=worker.get_block_ids_with_load_errors(),
+        ),
+    )
+    if abort or policy == "fail":
+        assert request.request_id not in scheduler.requests
+        assert not scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+    else:
+        assert request.num_computed_tokens == 0
+        resumed = scheduler.schedule()
+        assert (
+            resumed.num_scheduled_tokens[request.request_id]
+            == request.num_prompt_tokens
+        )
+        assert not scheduler.failed_recving_kv_req_ids
+
+
+@pytest.mark.parametrize("cleanup", [False, True])
+def test_request_finished_drops_queued_receive_except_cleanup(cleanup):
+    config = create_vllm_config(kv_connector="MooncakeConnector")
+    connector = create_scheduler(config).get_kv_connector().connector_scheduler
+    request = create_request(request_id=1, do_remote_prefill=True)
+    request.kv_transfer_params["do_remote_prefill"] = cleanup
+    request.kv_transfer_params["transfer_id"] = request.request_id
+    connector._reqs_need_recv[request.request_id] = (request, [[10]])
+    request.status = RequestStatus.FINISHED_ABORTED
+    assert connector.request_finished(request, ([10],)) == (False, None)
+    if cleanup:
+        assert connector._reqs_need_recv[request.request_id][1] == []
+    else:
+        assert request.request_id not in connector._reqs_need_recv

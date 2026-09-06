@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     SendBlockMeta,
     TransferRegion,
     _align_transfer_regions,
+    _validate_asymmetric_region_lengths,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
@@ -38,10 +39,16 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
+    MLAAttentionSpec,
 )
 from vllm.v1.request import RequestStatus
 
-from .utils import create_request, create_scheduler, create_vllm_config
+from .utils import (
+    create_model_runner_output,
+    create_request,
+    create_scheduler,
+    create_vllm_config,
+)
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
@@ -138,6 +145,108 @@ def test_align_transfer_regions_uses_layer_name_occurrences():
     assert err is None
     assert [r.base_addr for r in aligned_local] == [0x1000, 0x1100]
     assert [r.base_addr for r in aligned_remote] == [0xB000, 0xB100]
+
+
+def test_validate_asymmetric_region_lengths_mixed_replicated():
+    """Mixed TP-sharded + TP-invariant regions pass het-TP validation.
+
+    Models like MiniMax-M3 pair a TP-sharded GQA cache (scales with the TP
+    ratio) with a TP-invariant MLA side cache (same block length on both
+    sides). Validation must apply the TP-ratio rule per region instead of
+    rejecting the replicated region.
+    """
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=0x1000,
+            block_len=4096,
+            kv_block_len=4096,
+        ),
+        TransferRegion(
+            layer_name="model.layers.0.indexer",
+            layer_index=0,
+            base_addr=0x3000,
+            block_len=8192,
+            kv_block_len=8192,
+            replicated=True,
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=0xA000,
+            block_len=16384,
+            kv_block_len=16384,
+        ),
+        TransferRegion(
+            layer_name="model.layers.0.indexer",
+            layer_index=0,
+            base_addr=0xB000,
+            block_len=8192,
+            kv_block_len=8192,
+            replicated=True,
+        ),
+    ]
+
+    # Producer TP=4 -> consumer TP=1 (tp_ratio=4): GQA scales 4:1, the
+    # replicated indexer region only needs equal lengths.
+    assert (
+        _validate_asymmetric_region_lengths(
+            local_regions,
+            remote_regions,
+            local_tp_size=4,
+            remote_tp_size=1,
+            producer_cache_replicated=False,
+        )
+        is None
+    )
+
+    # A genuinely wrong sharded length is still rejected.
+    bad_sharded_remote = [
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=0xA000,
+            block_len=8192,
+            kv_block_len=8192,
+        ),
+        remote_regions[1],
+    ]
+    assert (
+        _validate_asymmetric_region_lengths(
+            local_regions,
+            bad_sharded_remote,
+            local_tp_size=4,
+            remote_tp_size=1,
+            producer_cache_replicated=False,
+        )
+        is not None
+    )
+
+    # A mismatched replicated length is still rejected.
+    bad_replicated_remote = [
+        remote_regions[0],
+        TransferRegion(
+            layer_name="model.layers.0.indexer",
+            layer_index=0,
+            base_addr=0xB000,
+            block_len=4096,
+            kv_block_len=4096,
+            replicated=True,
+        ),
+    ]
+    assert (
+        _validate_asymmetric_region_lengths(
+            local_regions,
+            bad_replicated_remote,
+            local_tp_size=4,
+            remote_tp_size=1,
+            producer_cache_replicated=False,
+        )
+        is not None
+    )
 
 
 @pytest.mark.asyncio
@@ -1054,6 +1163,61 @@ async def test_kv_consumuer(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_receive_kv_error_response_marks_request_failed(monkeypatch):
+    """An ERROR reply reports invalid blocks and receive completion."""
+
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies() as mocks:
+        decode_connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+        decode_worker = decode_connector.connector_worker
+        decode_worker.kv_caches_base_addr = [0x1000]
+        decode_worker.block_len_per_layer = [4096]
+        decode_worker.kv_block_len_per_layer = [4096]
+        decode_worker.registered_layer_names = ["model.layers.0.self_attn"]
+        decode_worker.registered_layer_indices = [0]
+        decode_worker.rpc_port = 54321
+
+        pull_metas = {
+            "d-req-fail": PullReqMeta(
+                d_req_id="d-req-fail",
+                transfer_id="xfer-req-fail",
+                local_block_ids=[[100, 101]],
+                remote_engine_id="p-engine",
+                remote_bootstrap_addr="http://bootstrap:33333",
+                pull_tasks_count=1,
+            )
+        }
+        decode_worker._remote_agents = {"p-engine": {0: {0: "tcp://producer:1234"}}}
+        decode_worker._tp_size["p-engine"] = 1
+
+        # The producer rejects the transfer (e.g. a region validation error).
+        error_response = MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.ERROR,
+            err_msg="region validation failed",
+        )
+        mocks["mock_socket_object"].recv.return_value = decode_worker._encoder.encode(
+            error_response
+        )
+
+        decode_worker.receive_kv("p-engine", pull_metas)
+        await asyncio.sleep(1)  # Allow async task to run
+
+        _, finished_recving = decode_worker.get_finished()
+        assert finished_recving == {"d-req-fail"}
+        assert decode_connector.get_block_ids_with_load_errors() == {100, 101}
+
+        # Clean up
+        decode_worker.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_worker_get_finished_timeout(monkeypatch):
     """Tests the cleanup mechanism for requests."""
 
@@ -1402,3 +1566,347 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
 
         prefill_worker.sender_loop = origin_sender_loop
         prefill_worker.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "p_tp_rank", [0, 1], ids=["rank0_sends_mla", "rank1_skips_mla"]
+)
+async def test_send_kv_to_decode_mixed_replicated_regions(monkeypatch, p_tp_rank):
+    """Mixed GQA+MLA model: het-TP send plans replicated regions per region.
+
+    Producer TP=4 sends to a consumer TP=1. The TP-sharded GQA region is
+    written at the producer rank's slice offset, while the TP-invariant MLA
+    region (e.g. MiniMax-M3's lightning indexer) is sent whole at offset 0
+    by producer rank 0 only.
+    """
+
+    P_TP_SIZE = 4
+    GQA_BLOCK_LEN = 4096
+    MLA_BLOCK_LEN = 8192
+
+    monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer"
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        prefill_connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+        prefill_worker = prefill_connector.connector_worker
+
+        # Override TP rank/size to simulate P TP=4.
+        prefill_worker.tp_rank = p_tp_rank
+        prefill_worker.tp_size = P_TP_SIZE
+        prefill_worker._tp_size[prefill_worker.engine_id] = P_TP_SIZE
+        prefill_worker.transfer_topo.tp_rank = p_tp_rank
+        prefill_worker.transfer_topo.tp_size = P_TP_SIZE
+
+        prefill_worker._layer_specs["model.layers.0.self_attn"] = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.float16,
+        )
+        prefill_worker._layer_specs["model.layers.0.indexer"] = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+        )
+
+        prefill_worker.kv_caches_base_addr = [0x1000, 0x3000]
+        prefill_worker.block_len_per_layer = [GQA_BLOCK_LEN, MLA_BLOCK_LEN]
+        prefill_worker.kv_block_len_per_layer = [GQA_BLOCK_LEN, MLA_BLOCK_LEN]
+        prefill_worker.registered_layer_names = [
+            "model.layers.0.self_attn",
+            "model.layers.0.indexer",
+        ]
+        prefill_worker.registered_layer_indices = [0, 0]
+
+        origin_sender_loop = prefill_worker.sender_loop
+        prefill_worker.sender_loop = asyncio.get_event_loop()
+
+        transfer_id = "xfer-mixed-1"
+        send_meta = SendBlockMeta(
+            p_req_id="p-req-mixed",
+            transfer_id=transfer_id,
+            local_block_ids=[[10, 11]],
+            ready=asyncio.Event(),
+        )
+        prefill_worker.reqs_need_send[transfer_id] = send_meta
+        send_meta.ready.set()
+
+        xfer_meta = MooncakeXferMetadata(
+            remote_hostname="consumer-host",
+            remote_port=54321,
+            remote_tp_size=1,
+            remote_tp_rank=0,
+            req_blocks={"d-req-mixed": (transfer_id, [[20, 21]])},
+            kv_caches_base_addr=[0xA000, 0xB000],
+            block_lens=[GQA_BLOCK_LEN * P_TP_SIZE, MLA_BLOCK_LEN],
+            kv_block_lens=[GQA_BLOCK_LEN * P_TP_SIZE, MLA_BLOCK_LEN],
+            registered_layer_names=[
+                "model.layers.0.self_attn",
+                "model.layers.0.indexer",
+            ],
+            registered_layer_indices=[0, 0],
+        )
+        mock_socket = AsyncMock(spec=zmq.asyncio.Socket)
+        mock_socket.send_multipart = AsyncMock()
+        identity = b"consumer-mixed"
+
+        with patch.object(
+            prefill_worker, "_send_blocks", return_value=0
+        ) as mock_send_blocks:
+            await prefill_worker.send_kv_to_decode(identity, mock_socket, xfer_meta)
+
+        src_ptrs, dst_ptrs, lengths = mock_send_blocks.call_args[0][1:]
+
+        # The GQA shard lands at this rank's TP-ratio slice of the remote
+        # region (no coalescing: remote block is tp_ratio times larger).
+        gqa_dst_off = (p_tp_rank % P_TP_SIZE) * GQA_BLOCK_LEN
+        expected_src = [
+            0x1000 + 10 * GQA_BLOCK_LEN,
+            0x1000 + 11 * GQA_BLOCK_LEN,
+        ]
+        expected_dst = [
+            0xA000 + 20 * GQA_BLOCK_LEN * P_TP_SIZE + gqa_dst_off,
+            0xA000 + 21 * GQA_BLOCK_LEN * P_TP_SIZE + gqa_dst_off,
+        ]
+        expected_lengths = [GQA_BLOCK_LEN, GQA_BLOCK_LEN]
+        if p_tp_rank == 0:
+            # The replicated MLA region is sent whole by rank 0 only, as one
+            # coalesced transfer at offset 0.
+            expected_src.append(0x3000 + 10 * MLA_BLOCK_LEN)
+            expected_dst.append(0xB000 + 20 * MLA_BLOCK_LEN)
+            expected_lengths.append(2 * MLA_BLOCK_LEN)
+
+        assert src_ptrs == expected_src
+        assert dst_ptrs == expected_dst
+        assert lengths == expected_lengths
+
+        mock_socket.send_multipart.assert_called_once()
+        _, sent_payload = mock_socket.send_multipart.call_args[0][0]
+        response = prefill_worker._xfer_resp_decoder.decode(sent_payload)
+        assert response.status == MooncakeXferResponseStatus.FINISH
+        assert response.ok_reqs == ["d-req-mixed"]
+
+        prefill_worker.sender_loop = origin_sender_loop
+        prefill_worker.shutdown()
+
+
+def test_replicated_layer_classification_per_group():
+    """Replication is classified per layer from the spec type.
+
+    MiniMax-M3 mixes a TP-sharded GQA cache (FullAttentionSpec) with a
+    1-head MLA-typed indexer side cache (replicated). A GQA layer must not
+    be classified replicated from num_kv_heads: the spec carries the
+    per-rank head count (total // tp_size), so a TP-sharded layer is
+    indistinguishable from a replicated one by head count alone.
+    """
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer"
+    )
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        connector = MooncakeConnector(
+            vllm_config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        )
+        worker = connector.connector_worker
+        worker.tp_size = 4
+        worker._layer_specs["gqa_sharded"] = FullAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
+        )
+        worker._layer_specs["indexer"] = MLAAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
+        )
+
+        # Per-rank num_kv_heads=1 on a TP=4 producer: still TP-sharded.
+        assert not worker._is_replicated_layer("gqa_sharded")
+        assert worker._is_replicated_layer("indexer")
+        assert not worker._is_replicated_layer("unknown")
+
+        worker.shutdown()
+
+
+@pytest.fixture
+def consumer_worker():
+    config = create_vllm_config(kv_connector="MooncakeConnector", kv_role="kv_consumer")
+    with set_current_vllm_config(config), patch_worker_dependencies() as mocks:
+        connector = MooncakeConnector(
+            config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        )
+        try:
+            yield connector.connector_worker, mocks
+        finally:
+            connector.connector_worker.shutdown()
+
+
+def _pull_meta(req_id="d-req", blocks=None, count=1):
+    return PullReqMeta(
+        d_req_id=req_id,
+        transfer_id=f"xfer-{req_id}",
+        local_block_ids=[[100, 101]] if blocks is None else blocks,
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+        pull_tasks_count=count,
+    )
+
+
+@pytest.mark.parametrize("failed_rank", [None, 0, 3])
+def test_receive_waits_for_all_producers_and_reports_once(consumer_worker, failed_rank):
+    """Do not release blocks while sibling producers can still write them."""
+    worker, _ = consumer_worker
+    meta = _pull_meta(count=4)
+    for rank in range(4):
+        pending = {meta.d_req_id: meta}
+        response = MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH,
+            ok_reqs=[] if rank == failed_rank else [meta.d_req_id],
+            err_reqs=[meta.d_req_id] if rank == failed_rank else [],
+        )
+        worker.process_pulling_result(response, pending)
+        # A repeated result from this connection cannot decrement twice.
+        worker.process_pulling_result(response, pending)
+        _, received = worker.get_finished()
+        invalid = worker.get_block_ids_with_load_errors()
+        assert received == ({meta.d_req_id} if rank == 3 else None)
+        assert invalid == (
+            {100, 101} if rank == 3 and failed_rank is not None else set()
+        )
+    assert worker.get_finished() == (None, None)
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+@pytest.mark.parametrize("blocks", [[], [[]], [[], []]])
+@pytest.mark.parametrize("failed", [False, True])
+def test_empty_pull_never_reports_receive_completion(consumer_worker, blocks, failed):
+    """Abort cleanup and full local prefix hits have no async block lease."""
+    worker, _ = consumer_worker
+    meta = _pull_meta(blocks=blocks)
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH,
+            ok_reqs=[] if failed else [meta.d_req_id],
+            err_reqs=[meta.d_req_id] if failed else [],
+        ),
+        {meta.d_req_id: meta},
+    )
+    assert worker.get_finished() == (None, None)
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["error", "exception", "incomplete_finish"])
+async def test_batch_error_does_not_refail_completed_requests(
+    consumer_worker, terminal
+):
+    """A later connection failure must only fail outstanding batch entries."""
+    worker, mocks = consumer_worker
+    complete = _pull_meta("complete", [[10]])
+    pending = _pull_meta("pending", [[20]])
+    first = worker._encoder.encode(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.CONTINUE, ok_reqs=["complete"]
+        )
+    )
+    last = (
+        RuntimeError("connection lost")
+        if terminal == "exception"
+        else worker._encoder.encode(
+            MooncakeXferResponse(
+                status=(
+                    MooncakeXferResponseStatus.ERROR
+                    if terminal == "error"
+                    else MooncakeXferResponseStatus.FINISH
+                )
+            )
+        )
+    )
+    mocks["mock_socket_object"].recv.side_effect = [first, last]
+    await worker.receive_kv_from_single_worker(
+        "tcp://producer:1234", {"complete": complete, "pending": pending}
+    )
+    assert worker.get_finished()[1] == {"complete", "pending"}
+    assert worker.get_block_ids_with_load_errors() == {20}
+    assert worker.get_finished() == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_failure_completes_pending_receive(consumer_worker):
+    worker, mocks = consumer_worker
+    mocks["mock_async_client"].return_value.__aenter__.side_effect = RuntimeError(
+        "bootstrap unavailable"
+    )
+    meta = _pull_meta(count=0)
+    await worker.handle_new_engine_id("p-engine", {meta.d_req_id: meta})
+    assert worker.get_finished()[1] == {meta.d_req_id}
+    assert worker.get_block_ids_with_load_errors() == {100, 101}
+    assert not worker._pending_bootstrap_queries
+
+
+@pytest.mark.parametrize("policy", ["fail", "recompute"])
+@pytest.mark.parametrize("abort", [False, True])
+def test_failed_receive_with_unmodified_scheduler(consumer_worker, policy, abort):
+    """Both failure channels must release or reschedule a real async request."""
+    worker, _ = consumer_worker
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_load_failure_policy=policy
+    )
+    scheduler = create_scheduler(config)
+    request = create_request(request_id=1, num_tokens=40, do_remote_prefill=True)
+    request.kv_transfer_params.update(
+        transfer_id=request.request_id, remote_bootstrap_addr="http://bootstrap:33333"
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    meta = output.kv_connector_metadata.reqs_to_recv["my-engine-id"][request.request_id]
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    meta.pull_tasks_count = 1
+    if abort:
+        scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+        assert request.request_id in scheduler.requests  # Blocks still leased.
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH, err_reqs=[request.request_id]
+        ),
+        {request.request_id: meta},
+    )
+    scheduler.update_from_output(
+        output,
+        create_model_runner_output(
+            [],
+            finished_recving=worker.get_finished()[1],
+            invalid_block_ids=worker.get_block_ids_with_load_errors(),
+        ),
+    )
+    if abort or policy == "fail":
+        assert request.request_id not in scheduler.requests
+        assert not scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+    else:
+        assert request.num_computed_tokens == 0
+        resumed = scheduler.schedule()
+        assert (
+            resumed.num_scheduled_tokens[request.request_id]
+            == request.num_prompt_tokens
+        )
+        assert not scheduler.failed_recving_kv_req_ids
+
+
+@pytest.mark.parametrize("cleanup", [False, True])
+def test_request_finished_drops_queued_receive_except_cleanup(cleanup):
+    config = create_vllm_config(kv_connector="MooncakeConnector")
+    connector = create_scheduler(config).get_kv_connector().connector_scheduler
+    request = create_request(request_id=1, do_remote_prefill=True)
+    request.kv_transfer_params["do_remote_prefill"] = cleanup
+    request.kv_transfer_params["transfer_id"] = request.request_id
+    connector._reqs_need_recv[request.request_id] = (request, [[10]])
+    request.status = RequestStatus.FINISHED_ABORTED
+    assert connector.request_finished(request, ([10],)) == (False, None)
+    if cleanup:
+        assert connector._reqs_need_recv[request.request_id][1] == []
+    else:
+        assert request.request_id not in connector._reqs_need_recv

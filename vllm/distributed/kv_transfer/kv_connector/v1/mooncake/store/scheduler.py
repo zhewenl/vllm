@@ -10,7 +10,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
-    mooncake_store_group_ids,
     partial_hash_hits_enabled,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
@@ -72,17 +71,14 @@ class MooncakeStoreScheduler:
         )
         self.client = LookupKeyClient(vllm_config)
         self.kv_cache_config = kv_cache_config
-        self._store_group_ids = mooncake_store_group_ids(kv_cache_config)
-        # Core reports block state (e.g. boundary-state offloads) in scheduler
-        # group ids, while the store indexes its groups positionally over
-        # ``_store_group_ids``. Groups outside the projection, such as the QSA
-        # ring, map to ``None`` here; ``None`` is never a member of
-        # ``_boundary_state_group_ids``, so lookups below skip them.
+        self._store_group_ids = kv_cache_config.prefix_cacheable_group_ids
+        # Map scheduler group IDs to store group indices. Groups outside the
+        # store projection, such as the QSA ring, map to None and are skipped.
         self._store_group_id_by_kv_cache_group_id = {
             group_id: store_group_id
             for store_group_id, group_id in enumerate(self._store_group_ids)
         }
-        store_groups = list(kv_cache_config.prefix_cacheable_transfer_groups)
+        store_groups = kv_cache_config.prefix_cacheable_groups
 
         # Align with the engine's own scheduler_block_size and hash_block_size.
         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(

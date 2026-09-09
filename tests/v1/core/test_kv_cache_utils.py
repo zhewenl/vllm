@@ -303,7 +303,7 @@ def test_kv_cache_config_selects_only_transferable_groups():
     )
 
 
-def test_kv_cache_config_selects_prefix_cacheable_transfer_groups():
+def test_kv_cache_config_selects_prefix_cacheable_groups():
     """Prefix stores exclude scratch state without changing transfer groups."""
     full_group = KVCacheGroupSpec(["full"], new_kv_cache_spec())
     qsa_group = KVCacheGroupSpec(
@@ -328,14 +328,14 @@ def test_kv_cache_config_selects_prefix_cacheable_transfer_groups():
 
     assert config.transfer_group_ids == (0, 1)
     assert config.select_transfer_block_ids(block_ids) == ([1], [2])
-    assert config.prefix_cacheable_transfer_group_ids == (0,)
-    assert config.prefix_cacheable_transfer_groups == (full_group,)
-    assert config.select_block_ids(
-        block_ids, config.prefix_cacheable_transfer_group_ids
-    ) == ([1],)
+    assert config.prefix_cacheable_group_ids == (0,)
+    assert config.prefix_cacheable_groups == (full_group,)
+    assert config.select_block_ids(block_ids, config.prefix_cacheable_group_ids) == (
+        [1],
+    )
 
     with pytest.raises(ValueError, match="Expected 3 KV cache groups, got 1"):
-        config.select_block_ids(([1],), config.prefix_cacheable_transfer_group_ids)
+        config.select_block_ids(([1],), config.prefix_cacheable_group_ids)
 
 
 def new_sliding_window_spec(

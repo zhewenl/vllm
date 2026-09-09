@@ -307,10 +307,7 @@ def test_current_save_block_ids_use_store_group_projection():
     )
     meta.add_request(req_meta)
     output = SimpleNamespace(
-        kv_connector_block_state=KVConnectorBlockState(
-            block_ids={"req-0": ([10], [80], [30])},
-            boundary_state_offloads={},
-        )
+        kv_connector_block_state=_make_connector_block_state(([10], [80], [30]))
     )
 
     scheduler._apply_current_save_block_ids(meta, output)
